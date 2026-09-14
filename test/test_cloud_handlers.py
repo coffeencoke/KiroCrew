@@ -805,19 +805,24 @@ def _compose(monkeypatch, provider):
 
 @pytest.mark.asyncio
 class TestProvisionerSeam:
-    async def test_stock_listing_is_the_builtin_lane(self, tmp_path):
-        """No composition: exactly the EC2 descriptor, drawn by the core's own form."""
+    async def test_stock_listing_is_the_ec2_lane_then_fargate(self, tmp_path):
+        """No composition: the EC2 descriptor first, drawn by the core's own form,
+        followed by the Fargate lane. The EC2 row is unchanged."""
         resp = await hc.api_cloud_provisioners(
             _req("GET", "/api/cloud/provisioners", state=_state(tmp_path))
         )
         assert resp.status == 200
         rows = _body(resp)["provisioners"]
-        assert [r["id"] for r in rows] == ["aws_ec2"]
+        assert [r["id"] for r in rows] == ["aws_ec2", "aws_fargate"]
         assert rows[0]["kind"] == "aws_ec2"
         assert rows[0]["posix_only"] is True
         assert [s["key"] for s in rows[0]["steps"]] == [
-            lj.STEP_PREFLIGHT, lj.STEP_PROVISION, lj.STEP_SIGNIN, lj.STEP_CONNECT,
+            lj.STEP_PREFLIGHT,
+            lj.STEP_PROVISION,
+            lj.STEP_SIGNIN,
+            lj.STEP_CONNECT,
         ]
+        assert rows[1]["kind"] == "aws_fargate"
 
     async def test_listing_answers_on_windows(self, tmp_path, monkeypatch):
         """The tab needs the list to pick a form; per-row ``posix_only`` carries

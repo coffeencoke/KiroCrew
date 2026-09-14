@@ -656,25 +656,56 @@ BUILTIN_REMOTE_PROVISIONER = RemoteProvisioner(
     posix_only=True,
 )
 
+#: The second lane: a Fargate task in the user's own account, driven by
+#: ``cloud.fargate_engine.FargateLaunchEngine``. Its ``id``/``kind`` string equals
+#: ``fargate_engine.FARGATE_PROVISIONER_ID``; the two are pinned together in
+#: :meth:`DefaultRemoteProvisionerProvider.engine_for`, which routes by the
+#: imported constant. ``kind`` is not ``aws_ec2``, so the SPA needs a
+#: ``registerRemoteProvisionerRenderer`` for it and an older frontend renders it
+#: as absent rather than as the EC2 prerequisites form. ``posix_only`` because the
+#: engine shells to the ``aws`` CLI exactly as the EC2 lane does.
+FARGATE_REMOTE_PROVISIONER = RemoteProvisioner(
+    id="aws_fargate",
+    kind="aws_fargate",
+    label="AWS Fargate in your own account",
+    posix_only=True,
+)
+
 
 class DefaultRemoteProvisionerProvider:
-    """The one provisioner the core ships: EC2 in the user's own AWS account.
+    """The provisioners the core ships: EC2 and Fargate in the user's own AWS
+    account.
 
-    ``provisioners()`` returns the single ``aws_ec2`` descriptor and
-    ``engine_for`` hands out ``RealLaunchEngine`` for it, so the stock Set-up
-    tab and its launch path are unchanged. A companion replaces this via
+    ``provisioners()`` returns the ``aws_ec2`` descriptor followed by the
+    ``aws_fargate`` one, in display order, and ``engine_for`` hands out
+    ``RealLaunchEngine`` for the first and ``FargateLaunchEngine`` for the second.
+    The stock Set-up tab and its EC2 launch path are unchanged: the EC2 descriptor
+    is first and byte-identical. A companion replaces this via
     ``dataclasses.replace(ctx, remote_provisioners=...)`` to add a lane (or
-    withdraw the AWS one on a fleet whose users have no AWS account of their
-    own). The engine import is deferred: ``cloud/launch_engine.py`` pulls in the
-    whole ``cloud/`` package and this module is loaded during ``platform`` init.
+    withdraw one on a fleet whose users have no AWS account of their own). Engine
+    imports are deferred: ``cloud/launch_engine.py`` and ``cloud/fargate_engine.py``
+    pull in the whole ``cloud/`` package and this module is loaded during
+    ``platform`` init.
+
+    The Fargate engine is constructed without a launch spec here, so a launch
+    through it refuses by naming the placement, image and secrets an operator must
+    supply. Where those are written down is deliberately a separate change; this
+    provider only makes the lane selectable.
     """
 
     def provisioners(self) -> List[RemoteProvisioner]:
-        return [BUILTIN_REMOTE_PROVISIONER]
+        return [BUILTIN_REMOTE_PROVISIONER, FARGATE_REMOTE_PROVISIONER]
 
     def engine_for(self, provisioner_id: str) -> Any:
-        if provisioner_id != BUILTIN_PROVISIONER_ID:
-            raise KeyError(provisioner_id)
-        from kiro_crew.cloud.launch_engine import RealLaunchEngine  # deferred: heavy
+        if provisioner_id == BUILTIN_PROVISIONER_ID:
+            from kiro_crew.cloud.launch_engine import RealLaunchEngine  # deferred: heavy
 
-        return RealLaunchEngine()
+            return RealLaunchEngine()
+        from kiro_crew.cloud.fargate_engine import (  # deferred: heavy
+            FARGATE_PROVISIONER_ID,
+            FargateLaunchEngine,
+        )
+
+        if provisioner_id == FARGATE_PROVISIONER_ID:
+            return FargateLaunchEngine()
+        raise KeyError(provisioner_id)
