@@ -71,7 +71,17 @@ export const CHUNK_BUDGETS = {
   // editor, store picker/card, carve, backups, retired) across all 13 catalogs
   // on top of that: with them the chunk builds at 11,332,186 B (11067 KB), so
   // the 5% headroom is taken over that measurement rather than main's.
-  all: 11620 * KB, // measured 11067 KB on feat/memory-v2-ui 2026-09-10 (~5% headroom)
+  // Re-measured 2026-09-16: main @ 0a64f54bf alone builds the chunk at
+  // 11,789,737 B (11513 KB) against the 11620 KB ceiling -- 0.9% headroom, so
+  // main has drifted to under 1% and any feature PR shipping a normal set of
+  // keys across the 13 catalogs fails the gate on its merge ref. The
+  // flagged-file delivery consent panel adds the consent-line, armed-step-up
+  // and status strings across all 13 catalogs, building the chunk at
+  // 11,912,975 B (11634 KB) -- still only the same 14 modules (13 catalogs plus
+  // the entry), no library reached it, and no lazy import() boundary can move a
+  // catalog string out of `all`. Same recurrence, same remedy: 5% convention
+  // taken over this measurement rather than main's.
+  all: 12216 * KB, // measured 11634 KB on feat/file-delivery-consent-panel-8793 2026-09-16 (~5% headroom)
 
   // The i18n RUNTIME — the i18next singleton, `initI18n`, the English catalog —
   // named after `src/i18n/t.ts`. Held separately from `all` above because
