@@ -76,7 +76,6 @@ from kiro_crew.cloud.fargate import (
 logger = logging.getLogger(__name__)
 
 __all__ = [
-    "FARGATE_PROVISIONER_ID",
     "MANAGED_TAG_VALUE",
     "Ownership",
     "TaskSighting",
@@ -88,12 +87,11 @@ __all__ = [
     "FargateLaunchEngine",
 ]
 
-#: The provisioner id ``platform.defaults.engine_for`` dispatches on to reach this
-#: engine. A distinct id rather than a reuse of ``aws_ec2``, because the built-in id
-#: gates ``size_key`` validation against the EC2 instance ladder and a Fargate
-#: cpu/memory pair is not on that ladder. It is spelled here rather than in an
-#: earlier change because the dispatch that reads it arrives with it.
-FARGATE_PROVISIONER_ID = "aws_fargate"
+#: Delimiter between the fields of a Fargate size_key vocabulary string
+#: ("<cpu>/<memory>" with an optional "/<gib>"). A data delimiter in this
+#: provisioner own size language, not a filesystem path separator, so
+#: it carries no platform meaning and _parse_size splits on it on every OS.
+FARGATE_SIZE_SEP = "/"
 
 
 class Ownership(enum.Enum):
@@ -417,7 +415,7 @@ def _parse_size(size_key: str) -> TaskSize:
     checks ``run_task_request`` makes, run here so an unusable key is refused with
     the legal pairs listed before any AWS call.
     """
-    parts = size_key.split("/")
+    parts = size_key.split(FARGATE_SIZE_SEP)
     legal = (
         'a Fargate size is "<cpu>/<memory>" in Fargate units, with an optional '
         '"/<gib>" ephemeral storage; the cpu/memory pairs are '
@@ -694,8 +692,10 @@ class FargateLaunchEngine:
                 cluster,
                 "--started-by",
                 started_by,
-                "--desired-status",
-                "RUNNING",
+                # startedBy must be the only ListTasks filter (the ECS API rejects
+                # it combined with any other), so no --desired-status here; RUNNING
+                # is the API default and ownership is decided from each task's
+                # lastStatus in classify_task, not from this filter.
             ],
             profile,
             region,

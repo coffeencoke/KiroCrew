@@ -15,7 +15,6 @@ import pytest
 from kiro_crew.cloud.launch_engine import RealLaunchEngine
 from kiro_crew.platform.defaults import (
     BUILTIN_REMOTE_PROVISIONER,
-    FARGATE_REMOTE_PROVISIONER,
     DefaultRemoteProvisionerProvider,
 )
 from kiro_crew.platform.interfaces import (
@@ -52,24 +51,13 @@ class TestDescriptor:
 
 
 class TestDefaultProvider:
-    def test_lists_the_ec2_lane_first_then_fargate(self):
+    def test_lists_exactly_the_builtin(self):
         rows = DefaultRemoteProvisionerProvider().provisioners()
-        assert rows == [BUILTIN_REMOTE_PROVISIONER, FARGATE_REMOTE_PROVISIONER]
-        # The EC2 lane stays first and byte-identical, so the stock Set-up tab is
-        # unchanged; Fargate is the added second lane.
-        assert rows[1].id == "aws_fargate"
-        assert rows[1].kind == "aws_fargate"
-        assert rows[1].posix_only is True
+        assert rows == [BUILTIN_REMOTE_PROVISIONER]
 
     def test_engine_for_the_builtin_is_the_ec2_engine(self):
         eng = DefaultRemoteProvisionerProvider().engine_for(BUILTIN_PROVISIONER_ID)
         assert isinstance(eng, RealLaunchEngine)
-
-    def test_engine_for_fargate_is_the_fargate_engine(self):
-        from kiro_crew.cloud.fargate_engine import FargateLaunchEngine
-
-        eng = DefaultRemoteProvisionerProvider().engine_for("aws_fargate")
-        assert isinstance(eng, FargateLaunchEngine)
 
     def test_engine_for_anything_else_is_a_key_error(self):
         with pytest.raises(KeyError):

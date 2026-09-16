@@ -32,7 +32,6 @@ from kiro_crew.cloud.fargate import (
     revision_fingerprint,
 )
 from kiro_crew.cloud.fargate_engine import (
-    FARGATE_PROVISIONER_ID,
     MANAGED_TAG_VALUE,
     FargateLaunchEngine,
     FargateLaunchSpec,
@@ -682,6 +681,23 @@ class _EcsDouble:
                 fp = revision_fingerprint(_spec_taskdef(region))
             return {"tags": [{"key": "kirocrew:revision-key", "value": fp}]}
         if op == "list-tasks":
+            # ListTasks documents startedBy as exclusive: "When you specify
+            # startedBy as the filter, it must be the only filter that you use."
+            # The real API answers a violation with InvalidParameterException, so a
+            # double that accepted one would be no evidence that the request this
+            # engine builds is well formed. --cluster is excluded because it scopes
+            # the search rather than filtering it.
+            if "--started-by" in args:
+                clash = sorted(
+                    f
+                    for f in ("--desired-status", "--family", "--service-name", "--launch-type")
+                    if f in args
+                )
+                if clash:
+                    raise AssertionError(
+                        "ListTasks rejects --started-by combined with "
+                        f"{', '.join(clash)}: startedBy must be the only filter"
+                    )
             return {"taskArns": [t["taskArn"] for t in self.tasks_for_teardown]}
         if op == "describe-tasks":
             return {"tasks": self.tasks_for_teardown}
@@ -945,7 +961,7 @@ def _run_through_engine(engine, store_root):
         profile="p",
         region="us-west-2",
         size_key="1024/2048",
-        provider_id=FARGATE_PROVISIONER_ID,
+        provider_id="aws_fargate",
     )
     job.tag = TAG
 
