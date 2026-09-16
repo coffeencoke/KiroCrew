@@ -8,9 +8,10 @@ import { MemoryRouter } from 'react-router-dom'
 import { configureStore } from '@reduxjs/toolkit'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { ThemeProvider } from '../hooks/useTheme'
-import chatReducer, { setQuestionCard, sseChatMessage, selectComposerBusy } from '../store/chatSlice'
+import chatReducer, { setQuestionCard, sseChatMessage, selectComposerBusy, selectSlotMessages } from '../store/chatSlice'
 import dashboardReducer from '../store/dashboardSlice'
 import notificationsReducer from '../store/notificationsSlice'
+import { store as appStore } from '../store'
 
 /* ChatPane sends must follow ChatPage's wire/bubble split for folder tokens
  * (issue #743 review finding): the API payload carries `[attached_dir N] path`
@@ -554,6 +555,116 @@ describe('ChatPane send — a failed send is reported on the pane', () => {
     reject(new Error('offline'))
 
     await waitFor(() => expect((box as HTMLTextAreaElement).value).toBe('same text'))
+  })
+})
+
+/* #10634: a NATIVE AskUserQuestion card is raised WHILE its own turn is still
+ * running and waiting on the answer, and it carries neither `ask_id` (the
+ * blocking backend card) nor `card_id` (the non-blocking `ask_question` MCP
+ * card). Answering it must STEER into the live turn, not queue behind it — the
+ * queue path is what left the question unanswered until timeout. When the turn
+ * has ended, the same card answer starts an ordinary next turn, exactly as the
+ * non-blocking card always does. */
+describe('ChatPane native question card (#10634) — steer while the turn is live', () => {
+  function nativeStore(slotKey: string, busy: boolean) {
+    const store = configureStore({
+      reducer: { dashboard: dashboardReducer, chat: chatReducer, notifications: notificationsReducer },
+      preloadedState: {
+        dashboard: {
+          status: null, connected: true,
+          // subagents_running is the slots-stream flag selectComposerBusy reads
+          // for a busy-without-active-turn slot; it makes the pane busy here.
+          slots: [{ key: slotKey, messages: 0, running: false, subagents_running: busy, mode: '', pending_approval: false, waiting_for_input: false, last_activity_ts: undefined }],
+          unreadSlots: [], refreshTrigger: 0, approvalMode: 'normal',
+          subagentRunning: {}, subagentDetails: {}, subagentText: {},
+        } as unknown as RootState['dashboard'],
+      } as Partial<RootState>,
+    })
+    // doSend's receipt adapter reads the module store; keep it in sync so the
+    // optimistic-bubble reconciliation resolves against the same state.
+    vi.spyOn(appStore, 'getState').mockImplementation(store.getState)
+    return store
+  }
+
+  function renderNative(slotKey: string, busy: boolean) {
+    const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } })
+    const store = nativeStore(slotKey, busy)
+    return Object.assign(render(
+      <Provider store={store}>
+        <QueryClientProvider client={qc}>
+          <ThemeProvider>
+            <MemoryRouter>
+              <ChatPane slotKey={slotKey} />
+            </MemoryRouter>
+          </ThemeProvider>
+        </QueryClientProvider>
+      </Provider>,
+    ), { store })
+  }
+
+  function seedNativeCard(store: ReturnType<typeof nativeStore>, slot: string) {
+    // No ask_id AND no card_id — the native card shape (chat_runner.py broadcasts
+    // { slot, questions } only). setQuestionCard with neither id reproduces it.
+    act(() => {
+      store.dispatch(setQuestionCard({
+        slot,
+        questions: [{ question: 'Which region?', options: [{ label: 'us-east-1' }] }],
+      }))
+    })
+  }
+
+  afterEach(() => vi.restoreAllMocks())
+
+  it('steers the answer (steer flag set) when the slot turn is live', async () => {
+    const { store } = renderNative('pane-native-live', true)
+    await waitFor(() => expect(selectComposerBusy(store.getState(), 'pane-native-live')).toBe(true))
+    seedNativeCard(store, 'pane-native-live')
+    fireEvent.click(await screen.findByText('us-east-1'))
+    fireEvent.click(screen.getByText('Submit'))
+
+    await waitFor(() => expect(api.sendChat).toHaveBeenCalledTimes(1))
+    const [wireText, slot, , , , steer] = vi.mocked(api.sendChat).mock.calls[0]
+    expect(wireText).toBe('us-east-1')
+    expect(slot).toBe('pane-native-live')
+    // The 6th arg is the steer flag: true == inject into the running turn.
+    expect(steer).toBe(true)
+    // A busy steer skips the optimistic bubble; the server echo supplies it. No
+    // error/notice means the receipt-aware path did not report a loss.
+    const rows = selectSlotMessages(store.getState(), 'pane-native-live')
+    expect(rows.some(m => m.role === 'error' || m.role === 'notice')).toBe(false)
+  })
+
+  it('starts an ordinary next turn (no steer flag) when the turn has ended', async () => {
+    const { store } = renderNative('pane-native-idle', false)
+    await waitFor(() => expect(selectComposerBusy(store.getState(), 'pane-native-idle')).toBe(false))
+    seedNativeCard(store, 'pane-native-idle')
+    fireEvent.click(await screen.findByText('us-east-1'))
+    fireEvent.click(screen.getByText('Submit'))
+
+    await waitFor(() => expect(api.sendChat).toHaveBeenCalledTimes(1))
+    const [wireText, slot, , , , steer] = vi.mocked(api.sendChat).mock.calls[0]
+    expect(wireText).toBe('us-east-1')
+    expect(slot).toBe('pane-native-idle')
+    // No steer: an idle slot has no live turn to inject into, so the answer
+    // starts a plain next turn — the non-blocking card's behaviour.
+    expect(steer).toBeFalsy()
+  })
+
+  it('recovers the answer when a live steer times out (response-late), never silently dropping it', async () => {
+    // The card clears on Submit, so the answer exists nowhere else. A busy steer
+    // mints no optimistic bubble, so a response-late must hand the answer back
+    // AND warn — the doSend receipt-aware path, not send()'s bare return.
+    vi.mocked(api.sendChat).mockRejectedValueOnce(new DOMException('The operation was aborted.', 'AbortError'))
+    const { store } = renderNative('pane-native-late', true)
+    await waitFor(() => expect(selectComposerBusy(store.getState(), 'pane-native-late')).toBe(true))
+    seedNativeCard(store, 'pane-native-late')
+    fireEvent.click(await screen.findByText('us-east-1'))
+    fireEvent.click(screen.getByText('Submit'))
+
+    await waitFor(() => expect(api.sendChat).toHaveBeenCalledTimes(1))
+    // The answer is handed back to the composer for the user to inspect/resend.
+    const box = (await screen.findAllByRole('textbox'))[0] as HTMLTextAreaElement
+    await waitFor(() => expect(box.value).toBe('us-east-1'))
   })
 })
 

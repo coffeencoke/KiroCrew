@@ -1407,6 +1407,31 @@ export default function ChatPane({
               }
             })
           }}
+          /* No-ask_id card: the card IS the interaction, answered in one click.
+             A native AskUserQuestion card is raised while its own turn is still
+             running and waiting on the answer, so a plain send would queue
+             behind that turn and the question would never be consumed (#10634).
+             When the slot is busy the turn is live, so steer the answer INTO it
+             (`steer: true`); when the turn has ended, `busy` is false and this
+             starts an ordinary next turn, exactly as the non-blocking
+             `ask_question` card does. `busy` is the shared `selectComposerBusy`
+             rule (chatSlice) the main chat keys on too, so the two routes match.
+
+             Recovery mirrors `onFallbackSend` above, and for the SAME reason: the
+             card clears on submit, so this answer exists nowhere else. A refusal,
+             a transport failure, OR a `response-late` (the steer's bubble is
+             suppressed while busy, so nothing on screen holds the text) all hand
+             the answer back to the composer instead of dropping it silently.
+             `onFallbackSend` is left untouched as the expired-blocking-card
+             (404) recovery path and is NOT reused here. */
+          onDirectSend={(text) => {
+            const fail = (reason?: string, status?: SendReceiptStatus) => { reportSendFailure(reason, status); restoreIntoComposer(text, [], slotKey) }
+            void sendTurn({ message: text, slot: slotKey, ...(busy ? { steer: true } : {}) }).then((receipt) => {
+              if (receipt.status === 'refused' || receipt.status === 'transport-error' || receipt.status === 'response-late') {
+                fail(receipt.reason, receipt.status)
+              }
+            })
+          }}
         />
 
         {/* No hand-off: the composer draft (`input`) below is unsaved local state. */}
