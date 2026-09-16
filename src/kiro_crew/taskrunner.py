@@ -6,8 +6,10 @@ Delegates to: task_models, task_planner, task_executor, task_reporter.
 from __future__ import annotations
 
 import asyncio
+import codecs
 import json
 import logging
+import os
 import threading
 import time
 from datetime import datetime, timezone
@@ -238,9 +240,43 @@ def _resolve_workspace_dir(raw: str) -> str:
 
 
 def _read_spec_prefix(path: str, max_chars: int) -> str:
-    """Read and normalize a bounded spec prefix on a worker thread."""
-    with open(path, encoding="utf-8") as spec_file:
-        return spec_file.read(max_chars).strip()
+    """Read and normalize a bounded spec prefix on a worker thread.
+
+    *path* has already passed ``hooks.validate_file_path``, but that judged the
+    NAME; re-opening the name would read whatever inode the name points at by
+    then. A hardlink alias shares its target's inode under an innocent name, so
+    every name-based check passes while the bytes belong to the target. The read
+    therefore goes through ``hooks.safe_read_file_bytes_nolink``: it opens FIRST
+    (refusing a link at the final component), ``fstat``s that one descriptor and
+    refuses ``st_nlink > 1``, a non-regular inode, and a sensitive or out-of-root
+    real path, then reads that same descriptor. ``within_root`` is the spec's own
+    directory, which also pins the opened inode on Windows where ``O_NOFOLLOW``
+    does not exist.
+
+    Returns ``""`` for anything the gate refuses or cannot read — the same empty
+    prefix the caller already substitutes for an unreadable spec, so a refusal
+    tells a caller nothing about whether a path is protected.
+    """
+    from kiro_crew.hooks import safe_read_file_bytes_nolink
+
+    # A UTF-8 code point is at most four bytes, so this many bytes always holds
+    # at least ``max_chars`` characters; the bound stays in characters below.
+    raw = safe_read_file_bytes_nolink(
+        path,
+        within_root=os.path.dirname(path),
+        max_bytes=4 * max_chars,
+        allow_truncate=True,
+    )
+    if raw is None:
+        return ""
+    # ``final=False`` keeps the strict decode of the text-mode read this
+    # replaces (invalid UTF-8 still raises, which the caller maps to "") while
+    # holding back a trailing code point the byte cap may have cut in half
+    # instead of reporting it as an error.
+    text = codecs.getincrementaldecoder("utf-8")().decode(raw, final=False)
+    # Universal newlines, as the text-mode read normalized them.
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
+    return text[:max_chars].strip()
 
 
 def _decompose_yaml_with_audit(
