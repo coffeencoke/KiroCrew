@@ -175,7 +175,7 @@ path, then reads the same descriptor — so a hardlink alias of a protected file
 under an innocent spec name yields no bytes. `within_root` is the spec's own directory,
 which is what carries the guarantee onto Windows, where `O_NOFOLLOW` does not exist.
 The byte cap is `4 * max_chars` with truncation allowed (a UTF-8 code point is at most
-four bytes), the decode is strict with the trailing code point held back, and newlines
+four bytes), the decode is strict — an incomplete sequence at EOF raises like any other malformed UTF-8 and the caller maps it to the empty prefix — except that a full-length result, the one case the byte cap itself may have cut mid code point, holds the dangling tail back (every complete character before such a cut already lies past `max_chars`), and newlines
 are normalized as the text-mode read they replace did. Every refusal, like every read
 error, becomes an empty prefix, so admission is no oracle for whether a path is
 protected.

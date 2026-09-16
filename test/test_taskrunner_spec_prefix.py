@@ -74,6 +74,21 @@ class TestReadSpecPrefix:
         with pytest.raises(UnicodeDecodeError):
             _read_spec_prefix(str(spec), 4000)
 
+    def test_an_incomplete_sequence_at_eof_still_raises(self, tmp_path: Path):
+        # Only a byte-cap cut may leave a dangling code point; a file that ENDS
+        # mid code point is malformed and must not become a shorter prefix.
+        spec = tmp_path / "task.md"
+        spec.write_bytes("# Title こ".encode("utf-8")[:-1])
+        with pytest.raises(UnicodeDecodeError):
+            _read_spec_prefix(str(spec), 4000)
+
+    def test_a_byte_cap_cut_mid_code_point_is_not_an_error(self, tmp_path: Path):
+        # 3-byte code points against a 4-bytes-per-char cap: the cut lands
+        # inside a code point, and the bound still yields exactly max_chars.
+        spec = tmp_path / "task.md"
+        spec.write_text("こ" * 100, encoding="utf-8")
+        assert _read_spec_prefix(str(spec), 5) == "こ" * 5
+
     def test_a_missing_spec_yields_an_empty_prefix(self, tmp_path: Path):
         assert _read_spec_prefix(str(tmp_path / "ghost.md"), 4000) == ""
 

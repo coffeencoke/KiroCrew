@@ -21,6 +21,7 @@ from kiro_crew.atomic_write import atomic_write
 from kiro_crew.config import live
 from kiro_crew.config.loader import KiroCrewConfig
 from kiro_crew.executors import run_in_embed_pool
+from kiro_crew.hooks import safe_read_file_bytes_nolink
 from kiro_crew.llm_helpers import stream_and_collect_json
 from kiro_crew.safety_override import safety_override
 from kiro_crew.security import is_sensitive_path, redact_credentials, redact_exfiltration_urls
@@ -257,23 +258,27 @@ def _read_spec_prefix(path: str, max_chars: int) -> str:
     prefix the caller already substitutes for an unreadable spec, so a refusal
     tells a caller nothing about whether a path is protected.
     """
-    from kiro_crew.hooks import safe_read_file_bytes_nolink
-
     # A UTF-8 code point is at most four bytes, so this many bytes always holds
     # at least ``max_chars`` characters; the bound stays in characters below.
+    read_limit = 4 * max_chars
     raw = safe_read_file_bytes_nolink(
         path,
         within_root=os.path.dirname(path),
-        max_bytes=4 * max_chars,
+        max_bytes=read_limit,
         allow_truncate=True,
     )
     if raw is None:
         return ""
-    # ``final=False`` keeps the strict decode of the text-mode read this
-    # replaces (invalid UTF-8 still raises, which the caller maps to "") while
-    # holding back a trailing code point the byte cap may have cut in half
-    # instead of reporting it as an error.
-    text = codecs.getincrementaldecoder("utf-8")().decode(raw, final=False)
+    # The decode is strict, as the text-mode read it replaces was: invalid
+    # UTF-8 raises and the caller maps it to "". The gate returns at most
+    # ``read_limit`` bytes without saying whether it cut, so a full-length
+    # result is the one case that may end mid code point through no fault of
+    # the file; there the tail is held back (``final=False``), which loses
+    # nothing — every complete character before a cut at ``read_limit`` bytes
+    # lies at or past index ``max_chars`` and is dropped by the bound below. A
+    # shorter result is the whole file and is finalized, so an incomplete
+    # sequence at EOF is the malformed spec it is, not a silently shorter one.
+    text = codecs.getincrementaldecoder("utf-8")().decode(raw, final=len(raw) < read_limit)
     # Universal newlines, as the text-mode read normalized them.
     text = text.replace("\r\n", "\n").replace("\r", "\n")
     return text[:max_chars].strip()
