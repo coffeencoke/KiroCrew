@@ -124,7 +124,6 @@ vi.mock('../pierre/PierreImpl', async () => {
       <div key={generation}>{children}</div>
     ),
     usePierreWorkerPool: () => pierre.poolState.current,
-    useRegisterEditorSurface: () => {},
   }
 })
 

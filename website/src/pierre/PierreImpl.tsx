@@ -5,8 +5,7 @@
  * of them resolve their options through `./config` — the single place the
  * look/behavior of code and diff rendering is decided.
  */
-import { createPortal } from 'react-dom'
-import { useCallback, useEffect, useId, useMemo, useRef, useSyncExternalStore } from 'react'
+import { useId, useMemo, useSyncExternalStore } from 'react'
 import type { BaseCodeOptions, FileContents, SupportedLanguages } from '@pierre/diffs'
 import { EXTENSION_TO_FILE_FORMAT, parsePatchFiles, setCustomExtension } from '@pierre/diffs'
 import { File, FileDiff, MultiFileDiff, Virtualizer, WorkerPoolContext } from '@pierre/diffs/react'
@@ -325,81 +324,15 @@ export function activeWorkerPool(state: WorkerPoolSnapshot): WorkerPoolManager |
   return undefined
 }
 
-const passiveNoticeClaimants = new Set<symbol>()
-const passiveNoticeListeners = new Set<() => void>()
-let passiveNoticeOwner: symbol | undefined
-/** The terminal phase never exits, so the one notice is dismissible and the
- *  dismissal is tab-wide: no surface re-raises it until reload. */
-let passiveNoticeDismissed = false
-
-function dismissPassiveNotice() {
-  passiveNoticeDismissed = true
-  for (const notify of [...passiveNoticeListeners]) notify()
-}
-
-/** Mounted editor surfaces in this tab. While one exists the passive notice
- *  stays silent: telling a reader on a read-only surface to reload would risk
- *  a draft they cannot see, and the editor already shows its own save-first
- *  notice where the draft lives. The global notice returns once every editor
- *  has unmounted. */
-const editorSurfaceIds = new Set<symbol>()
-const editorSurfaceListeners = new Set<() => void>()
-
-function subscribeEditorSurfaces(listener: () => void): () => void {
-  editorSurfaceListeners.add(listener)
-  return () => { editorSurfaceListeners.delete(listener) }
-}
-
-export function useRegisterEditorSurface(): void {
-  const id = useRef(Symbol('pierre-editor-surface')).current
-  useEffect(() => {
-    editorSurfaceIds.add(id)
-    for (const notify of [...editorSurfaceListeners]) notify()
-    return () => {
-      editorSurfaceIds.delete(id)
-      for (const notify of [...editorSurfaceListeners]) notify()
-    }
-  }, [id])
-}
-
-function subscribePassiveNotice(id: symbol, listener: () => void): () => void {
-  passiveNoticeClaimants.add(id)
-  if (passiveNoticeOwner === undefined) passiveNoticeOwner = id
-  passiveNoticeListeners.add(listener)
-  for (const notify of [...passiveNoticeListeners]) notify()
-  return () => {
-    passiveNoticeClaimants.delete(id)
-    passiveNoticeListeners.delete(listener)
-    if (passiveNoticeOwner === id) passiveNoticeOwner = passiveNoticeClaimants.values().next().value
-    for (const notify of [...passiveNoticeListeners]) notify()
-  }
-}
-
 function PierreWorkerUnavailableNotice() {
-  const id = useRef(Symbol('pierre-worker-unavailable-notice')).current
-  const subscribe = useCallback(
-    (listener: () => void) => subscribePassiveNotice(id, listener),
-    [id],
-  )
-  const ownsNotice = useSyncExternalStore(
-    subscribe,
-    () => passiveNoticeOwner === id && !passiveNoticeDismissed,
-    () => false,
-  )
-  const editorMounted = useSyncExternalStore(
-    subscribeEditorSurfaces,
-    () => editorSurfaceIds.size > 0,
-    () => false,
-  )
-  if (!ownsNotice || editorMounted || typeof document === 'undefined') return null
-  return createPortal(
+  return (
     <ErrorNotice
       askAgent
-      onDismiss={dismissPassiveNotice}
-      className="fixed bottom-safe-offset-4 right-safe-offset-4 z-[100] w-[min(32rem,calc(100vw-2rem))] shadow-lg"
+      variant="inline"
+      className="w-full shrink-0 border-b border-border bg-bg-elevated px-3 py-1 text-[11px]"
       message={i18nT('components.pierreEditorImpl.highlighting_unavailable_content_readable_reload')}
-    />,
-    document.body,
+      testId="pierre-worker-unavailable"
+    />
   )
 }
 
@@ -500,8 +433,8 @@ export function PierreCodeImpl({ file, options, className, langHint, scrollClass
   }, [file, langHint, surfaceId])
   if (activePool === undefined) {
     const fallback = <>
-      <PlainCodeFallback text={resolvedFile.contents} />
       {poolState.phase === 'unavailable' ? <PierreWorkerUnavailableNotice /> : null}
+      <PlainCodeFallback text={resolvedFile.contents} />
     </>
     return scrollClassName ? <div className={scrollClassName}>{fallback}</div> : fallback
   }
@@ -569,8 +502,8 @@ export function PierrePatchImpl({ patch, options, className, renderHeaderMetadat
     // No header actions in the fallback (`max-two-buttons-per-row`); they
     // return with Pierre's own header when a generation is ready.
     return <>
-      <PlainCodeFallback text={patch} />
       {poolState.phase === 'unavailable' ? <PierreWorkerUnavailableNotice /> : null}
+      <PlainCodeFallback text={patch} />
     </>
   }
   return (
@@ -654,6 +587,7 @@ export function PierreFilePairImpl({ oldFile, newFile, options, className, fallb
   if (activePool === undefined) {
     return (
       <>
+        {poolState.phase === 'unavailable' ? <PierreWorkerUnavailableNotice /> : null}
         <PlainFilePairFallback
           oldFile={keyedOld}
           newFile={keyedNew}
@@ -665,7 +599,6 @@ export function PierreFilePairImpl({ oldFile, newFile, options, className, fallb
           renderHeaderPrefix={renderHeaderPrefix}
           renderHeaderFilenameSuffix={renderHeaderFilenameSuffix}
         />
-        {poolState.phase === 'unavailable' ? <PierreWorkerUnavailableNotice /> : null}
       </>
     )
   }

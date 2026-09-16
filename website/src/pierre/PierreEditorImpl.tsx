@@ -17,7 +17,7 @@ import {
   pierreFileOptions,
   pierreThemeType,
 } from './config'
-import { activeWorkerPool, contentCacheKey, PierreShell, usePierreWorkerPool, useRegisterEditorSurface } from './PierreImpl'
+import { activeWorkerPool, contentCacheKey, PierreShell, usePierreWorkerPool } from './PierreImpl'
 import { isPierreFilePairWithinBudget } from './renderBudget'
 
 export interface EditorMarker {
@@ -101,7 +101,6 @@ export const PierreEditorImpl = forwardRef<PierreEditorHandle, {
 }>(function PierreEditorImpl({ file, options, onChange, onSave, markers, onCursorChange, diffBase, diffSplit, diffExpandUnchanged, className }, ref) {
   const dark = useIsDark()
   const poolState = usePierreWorkerPool()
-  useRegisterEditorSurface()
   const activePool = activeWorkerPool(poolState)
   const pierreActive = activePool !== undefined
   const resolved = useMemo(
