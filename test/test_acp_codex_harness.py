@@ -12,11 +12,12 @@ codex actually has. A real codex-acp cannot stand in for this here: ``session/ne
 answers ``-32000 Authentication required`` without an OpenAI login, so a live adapter
 can only be taken as far as ``initialize``.
 
-The second half pins the switch. ``KIROCREW_CODEX_ACP_RUNTIME`` is OFF by default,
-and off it must be as if it did not exist: codex stays on AcpClient, and the
-capability sets keep the members they shipped with. On, codex reads as a runtime
-backend at both gates. The default-off half is the one that would fail if this change
-altered product behaviour, which is the whole claim it makes.
+The second half pins the TRANSPORT and the three sets that disagree about this
+host. codex is served by ``AcpRuntime``; it is in ``ACP_BACKENDS_SESSION_SHARING``
+because its teardown leaves a session addressable; and it is absent from
+``ACP_BACKENDS_SESSION_EVICTION`` for that same reason, which is what keeps the
+high-churn background path off it. One measured fact read three ways, so the half
+exists to stop any one of the three drifting on its own.
 
 The seam-level contract every harness answers is in
 ``test_acp_harness_contract.py``; codex is parametrised into it. What is here is what
@@ -55,6 +56,7 @@ from kiro_crew.acp.types import (
     ACP_BACKENDS_ADVERTISED_MODEL_SELECTION,
     ACP_BACKENDS_EFFORT_VIA_CONFIG_OPTION,
     ACP_BACKENDS_HARNESS_OWNED_SESSIONS,
+    ACP_BACKENDS_KIRO_SLASH_COMMANDS,
     ACP_BACKENDS_SESSION_SHARING,
     ACP_BACKENDS_STEER,
     METHOD_CANCEL,
@@ -64,9 +66,7 @@ from kiro_crew.acp.types import (
     METHOD_SET_MODE,
 )
 from kiro_crew.agent_sdk.backends import (
-    ENV_CODEX_ACP_RUNTIME,
-    acp_runtime_backends,
-    codex_runs_on_acp_runtime,
+    ACP_BACKENDS_SESSION_EVICTION,
     effort_config_option_id,
 )
 from kiro_crew.providers.acp import AcpProvider
@@ -87,8 +87,10 @@ class FakeCodexPeer:
     * ``sessions`` is a map, like the adapter's own ``this.sessions``, so "two
       session/new on one process" is observable as two entries rather than two calls.
     * ``mcpCapabilities`` advertises ``http`` only, which is what the real adapter
-      advertises, and ``session/new`` REFUSES the whole request with ``-32600`` when
-      an ``sse`` element reaches it -- the failure the array narrowing prevents.
+      advertises, and ``session/new`` ACCEPTS an ``sse`` element anyway -- recording
+      it in the session verbatim. That is the measured behaviour and it is the
+      reason the narrowing exists: the adapter raises nothing, so an unnarrowed
+      element becomes a server that is silently never wired.
 
     Every frame is round-tripped through ``json.dumps``/``loads`` so a payload that
     is not JSON-serialisable fails here rather than at a real pipe.
@@ -146,9 +148,10 @@ class FakeCodexPeer:
         assert self.initialized, "session/new before initialize"
         assert params["cwd"], "codex-acp requires a cwd"
         assert "_meta" not in params, "codex-acp reads none of Crew's _meta"
-        for element in params.get("mcpServers") or []:
-            if isinstance(element, dict) and element.get("type") == "sse":
-                raise CodexRpcError(-32600, "Invalid Request")
+        # No validation against the advertised transports, deliberately: the real
+        # adapter accepts an element it declared unsupported and answers normally.
+        # Modelling a refusal here would make the narrowing look like
+        # error-avoidance and let a test pass by catching an error nothing raises.
         self._next_id += 1
         sid = f"thread-{self._next_id}"
         self.sessions[sid] = {"cwd": params["cwd"], "mcpServers": params.get("mcpServers") or []}
@@ -235,17 +238,17 @@ class TestRegistry:
         assert isinstance(resolved, CodexHarness)
         assert resolved.backend == ACP_BACKEND_CODEX
 
-    def test_registration_does_not_follow_the_switch(self, monkeypatch):
+    def test_registration_is_a_separate_question_from_routing(self):
         """Two different questions, and conflating them breaks both answers.
 
-        The registry answers "can the shared-process runtime drive this host?"; the
-        switch answers "does a codex session take that path today?". A registry gated
-        on the switch would make the harness unreachable to its own tests and to an
-        operator trying the preview.
+        The registry answers "can the shared-process runtime drive this host?";
+        ``ACP_BACKENDS_ACP_RUNTIME`` answers "does a session take that path?". They
+        agree for codex, and they are still separate: a harness is written and
+        tested before it is routed, so a registry gated on the set would make one
+        unreachable to its own tests.
         """
-        monkeypatch.delenv(ENV_CODEX_ACP_RUNTIME, raising=False)
         assert isinstance(harness_for(ACP_BACKEND_CODEX), CodexHarness)
-        assert codex_runs_on_acp_runtime() is False
+        assert ACP_BACKEND_CODEX in ACP_BACKENDS_ACP_RUNTIME
 
 
 class TestHandshake:
@@ -326,27 +329,31 @@ class TestMcpArrayNarrowing:
         )
         assert [s["name"] for s in peer.sessions[sid]["mcpServers"]] == ["keep"]
 
-    def test_an_unnarrowed_sse_element_would_have_cost_the_whole_session(self, adapter):
-        """Why the narrowing is not cosmetic: -32600 is the WHOLE request, not one server.
+    def test_an_unnarrowed_sse_element_is_accepted_and_silently_unwired(self, adapter):
+        """Why the narrowing is not cosmetic: nothing else catches this.
 
-        Sent deliberately unnarrowed, so this fails if the peer ever stops modelling
-        the refusal and the test above starts passing vacuously.
+        The adapter advertises ``sse: false`` and then accepts an ``sse`` element,
+        answering ``session/new`` normally. So the cost of skipping the narrowing is
+        not a failed request anyone can see -- it is a session that runs with a
+        server the adapter never wired, which no downstream check can detect.
+
+        Sent deliberately unnarrowed, so this fails if the peer ever starts
+        modelling a refusal and the test above begins passing for the wrong reason.
         """
         peer = FakeCodexPeer()
         peer.request("initialize", _initialize_params(adapter))
-        with pytest.raises(CodexRpcError) as exc:
-            peer.request(
-                "session/new",
-                {
-                    "cwd": "/w",
-                    "mcpServers": [
-                        {"name": "keep", "url": "http://keep"},
-                        {"name": "drop", "type": "sse", "url": "http://drop"},
-                    ],
-                },
-            )
-        assert exc.value.code == -32600
-        assert peer.sessions == {}
+        result = peer.request(
+            "session/new",
+            {
+                "cwd": "/w",
+                "mcpServers": [
+                    {"name": "keep", "url": "http://keep"},
+                    {"name": "drop", "type": "sse", "url": "http://drop"},
+                ],
+            },
+        )
+        sid = result["sessionId"]
+        assert [s["name"] for s in peer.sessions[sid]["mcpServers"]] == ["keep", "drop"]
 
     def test_a_narrowed_list_is_not_aliased(self, adapter):
         """A session must not be able to mutate the caller's list after the fact."""
@@ -793,20 +800,53 @@ class TestSpawnMasks:
         assert not hasattr(harness_mod, "resolve_mask_only")
 
 
-class TestReclaimIsInheritedUnchanged:
-    def test_the_operator_configured_thresholds_pass_straight_through(self, adapter):
-        """No guessed constant: the codex profile has not been measured yet.
+class TestReclaimIsScopedToTheCore:
+    """The ceiling and the scope are one decision, so they are pinned together."""
 
-        Pinned so adding a number here is a visible edit rather than a quiet one,
-        and so a measurement that narrows the ceiling has to change a test that
-        states the pass-through answer outright.
+    def test_the_ceiling_is_the_measured_core_number_not_the_operators(self, adapter):
+        """A subtree budget cannot be applied to two processes.
+
+        ``rss_depth`` changes what is being counted, so the incoming ``max_rss_mb``
+        describes a quantity this policy does not measure. Pinned as a literal so
+        raising or lowering the ceiling is a visible edit.
         """
         policy = adapter.reclaim_policy(max_age_secs=3600.0, max_rss_mb=500.0)
-        assert (policy.max_age_secs, policy.max_rss_mb) == (3600.0, 500.0)
+        assert policy.max_rss_mb == 1024.0
+
+    @pytest.mark.asyncio
+    async def test_the_spawn_scope_includes_a_resident_launcher(self, adapter):
+        """The pid-relative depth reaches app-server through a resident launcher."""
+        from kiro_crew.acp import client as client_mod
+
+        with (
+            patch.object(
+                client_mod, "_resolve_codex_acp_bin", return_value=(["/n/node", "/p/i.js"], "/s")
+            ),
+            patch.object(harness_mod, "resolve_spawn_masks", new=AsyncMock(return_value=((), ()))),
+            patch.object(harness_mod, "_sandbox_wrapper_generations", return_value=1),
+        ):
+            plan = await adapter.resolve_spawn(_ctx())
+        assert plan.rss_depth == 2
+
+    def test_age_still_passes_straight_through(self, adapter):
+        """Nothing about age changes with the measurement scope."""
+        policy = adapter.reclaim_policy(max_age_secs=1234.0, max_rss_mb=500.0)
+        assert policy.max_age_secs == 1234.0
+
+    def test_the_ceiling_clears_the_measured_core_with_headroom(self, adapter):
+        """522 MB is the core at eight sessions in the worse of the two runs.
+
+        A ceiling at or under it would recycle a process that is merely busy, which
+        is the failure the default 500 produces. Asserted as an inequality against
+        the measurement rather than a second copy of the constant, so the two cannot
+        drift into agreeing with each other and disagreeing with the probe.
+        """
+        policy = adapter.reclaim_policy(max_age_secs=3600.0, max_rss_mb=500.0)
+        assert policy.max_rss_mb > 522.0
 
 
 # ---------------------------------------------------------------------------
-# Half two: the switch, and what it must not change while it is off
+# Half two: the transport, and the three sets that read one fact differently
 # ---------------------------------------------------------------------------
 
 
@@ -818,117 +858,144 @@ def _build_provider(backend: str) -> AcpProvider:
     return provider
 
 
-class TestTheSwitchIsOffByDefault:
-    def test_an_unset_variable_reads_as_off(self, monkeypatch):
-        monkeypatch.delenv(ENV_CODEX_ACP_RUNTIME, raising=False)
-        assert codex_runs_on_acp_runtime() is False
-
-    def test_off_the_gate_answers_the_shipped_set_verbatim(self, monkeypatch):
-        monkeypatch.delenv(ENV_CODEX_ACP_RUNTIME, raising=False)
-        assert acp_runtime_backends() == ACP_BACKENDS_ACP_RUNTIME
-
-    def test_off_codex_still_takes_the_acp_client_path(self, monkeypatch):
-        monkeypatch.delenv(ENV_CODEX_ACP_RUNTIME, raising=False)
-        assert _build_provider(ACP_BACKEND_CODEX).is_acp_runtime_backend is False
-
-    @pytest.mark.parametrize("value", ["", "0", "false", "no", "off", "maybe", " "])
-    def test_a_falsey_or_unrecognised_value_reads_as_off(self, monkeypatch, value):
-        """An operator exporting ``=0`` to keep a preview off must not get it on.
-
-        The mistake would be silent: the session starts either way, just on the other
-        transport.
-        """
-        monkeypatch.setenv(ENV_CODEX_ACP_RUNTIME, value)
-        assert codex_runs_on_acp_runtime() is False
-        assert acp_runtime_backends() == ACP_BACKENDS_ACP_RUNTIME
-
-    def test_the_other_harnesses_are_unaffected_either_way(self, monkeypatch):
-        for value in ("0", "1"):
-            monkeypatch.setenv(ENV_CODEX_ACP_RUNTIME, value)
-            assert _build_provider(ACP_BACKEND_KIRO).is_acp_runtime_backend is True
-            assert _build_provider(ACP_BACKEND_KAS).is_acp_runtime_backend is True
-            assert _build_provider(ACP_BACKEND_CLAUDE).is_acp_runtime_backend is False
-
-
-class TestTheSwitchOn:
-    @pytest.mark.parametrize("value", ["1", "true", "TRUE", "yes", "on", " on "])
-    def test_a_truthy_value_reads_as_on(self, monkeypatch, value):
-        monkeypatch.setenv(ENV_CODEX_ACP_RUNTIME, value)
-        assert codex_runs_on_acp_runtime() is True
-
-    def test_on_codex_joins_the_runtime_answer(self, monkeypatch):
-        monkeypatch.setenv(ENV_CODEX_ACP_RUNTIME, "1")
-        assert acp_runtime_backends() == ACP_BACKENDS_ACP_RUNTIME | {ACP_BACKEND_CODEX}
-
-    def test_on_the_provider_reads_as_a_runtime_backend(self, monkeypatch):
-        monkeypatch.setenv(ENV_CODEX_ACP_RUNTIME, "1")
+class TestCodexIsServedByTheSharedRuntime:
+    def test_the_provider_reads_as_a_runtime_backend(self):
         assert _build_provider(ACP_BACKEND_CODEX).is_acp_runtime_backend is True
 
-    def test_on_the_background_path_is_still_out_of_reach(self, monkeypatch):
-        """The switch is foreground-only, and that is the point of it.
+    def test_the_shipped_set_names_it(self):
+        """Pinned as a literal set, so gaining or losing a member is a visible edit."""
+        assert ACP_BACKENDS_ACP_RUNTIME == frozenset(
+            {ACP_BACKEND_KIRO, ACP_BACKEND_KAS, ACP_BACKEND_CODEX}
+        )
 
-        Background handles are the high-churn ones — title generation,
-        suggestions, folders and nav each take their own ephemeral sessionId,
-        many per conversation. codex's teardown verb is ``session/cancel``, which
-        ends the turn without evicting the session from the adapter's map, so a
-        shared process would grow at a rate the user never controls and nothing
-        Crew can send reclaims it. Foreground leaks the same way, at the rate a
-        person opens chats, where the age/RSS recycle eventually collects the
-        process.
+    def test_the_other_harnesses_keep_their_answers(self):
+        assert _build_provider(ACP_BACKEND_KIRO).is_acp_runtime_backend is True
+        assert _build_provider(ACP_BACKEND_KAS).is_acp_runtime_backend is True
+        assert _build_provider(ACP_BACKEND_CLAUDE).is_acp_runtime_backend is False
+
+    def test_membership_is_read_from_the_set_and_not_inferred(self):
+        """The property must not be spelled as "everything that is not claude".
+
+        With three members that inference happens to agree, which is exactly why it
+        is worth pinning: a harness added later would inherit the shared-runtime
+        path without anyone deciding it should.
         """
-        monkeypatch.setenv(ENV_CODEX_ACP_RUNTIME, "1")
+        import ast
+        import inspect
+        import textwrap
+
+        tree = ast.parse(
+            textwrap.dedent(inspect.getsource(AcpProvider.is_acp_runtime_backend.fget))
+        )
+        # The docstring names the spelling it rejects, so strip it: a substring scan
+        # over the whole source passes or fails on the prose rather than the code.
+        for node in ast.walk(tree):
+            if isinstance(node, ast.FunctionDef):
+                if node.body and isinstance(node.body[0], ast.Expr):
+                    if isinstance(node.body[0].value, ast.Constant):
+                        node.body = node.body[1:]
+        body = ast.unparse(tree)
+        assert "ACP_BACKENDS_ACP_RUNTIME" in body
+        assert "is_claude_backend" not in body
+
+    def test_running_here_does_not_hand_it_the_kiro_family_conventions(self):
+        """The transport set is not the cli.json set, and codex proves it.
+
+        codex reads no ``cli.json`` overlay -- it takes effort over
+        ``session/set_config_option`` -- so a site that keyed overlay work off the
+        transport would write a file this host ignores and seed its effort map from
+        another harness's copy.
+        """
+        assert ACP_BACKEND_CODEX in ACP_BACKENDS_ACP_RUNTIME
+        assert ACP_BACKEND_CODEX not in ACP_BACKENDS_KIRO_SLASH_COMMANDS
+
+
+class TestOneFactReadThreeWays:
+    """``session/cancel`` does not dispose the session. Three sets act on that."""
+
+    def test_it_does_not_share_sessions_though_the_harness_could(self):
+        """Absent on CREW's limit, not the harness's, which is why it is pinned here.
+
+        The adapter WOULD hold a shared session: ``session/cancel`` leaves one
+        addressable with its context resident. What cannot resolve is the
+        continuation -- the shared-subagent path persists a provider label
+        ``SessionMap`` reads as kiro-cli, so ``spawn_continue`` on a codex subagent
+        answers ``conversation_gone``. Membership would advertise exactly the
+        capability it exists to grant and break it on the ordinary path.
+
+        Pinned as an exclusion rather than left to the set's default, because the
+        harness capability is real and a later reader would otherwise add it back
+        on the strength of the half that passes.
+        """
+        assert ACP_BACKEND_CODEX not in ACP_BACKENDS_SESSION_SHARING
+        assert _build_provider(ACP_BACKEND_CODEX).is_session_sharing_eligible is False
+
+    def test_running_on_the_shared_runtime_did_not_grant_sharing(self):
+        """The superset relation must not be read as an implication.
+
+        ``ACP_BACKENDS_ACP_RUNTIME`` is a superset of the sharing set, so a harness
+        can be in the first and out of the second -- which is the whole point of
+        their being two sets. KAS is the standing precedent and codex is the second
+        instance, so the relation is asserted rather than assumed.
+        """
+        assert ACP_BACKEND_CODEX in ACP_BACKENDS_ACP_RUNTIME
+        assert ACP_BACKEND_CODEX not in ACP_BACKENDS_SESSION_SHARING
+        assert ACP_BACKENDS_SESSION_SHARING < ACP_BACKENDS_ACP_RUNTIME
+
+    def test_it_is_absent_from_the_eviction_set_for_the_same_reason(self):
+        """The property that earns sharing is the one that denies eviction.
+
+        Not a contradiction: a session that outlives its teardown is what
+        ``spawn_continue`` needs and what an unbounded churn of throwaway sessions
+        cannot afford.
+        """
+        assert ACP_BACKEND_CODEX not in ACP_BACKENDS_SESSION_EVICTION
+        assert ACP_BACKENDS_SESSION_EVICTION == frozenset({ACP_BACKEND_KIRO, ACP_BACKEND_KAS})
+
+    def test_the_background_path_is_out_of_reach(self):
+        """Background handles are the high-churn ones.
+
+        Title generation, suggestions, folders and nav each take their own ephemeral
+        sessionId, many per conversation, at a rate the user never controls. Every
+        one of them would stay resident on this host, so the eviction term in
+        ``_bg_runtime_backends`` is what excludes it.
+        """
         from kiro_crew.session import _bg_runtime_backends
 
         assert ACP_BACKEND_CODEX not in _bg_runtime_backends()
 
-    def test_off_the_background_path_may_not_either(self, monkeypatch):
-        monkeypatch.delenv(ENV_CODEX_ACP_RUNTIME, raising=False)
-        from kiro_crew.session import _bg_runtime_backends
+    def test_the_background_path_excludes_it_by_eviction_not_by_name(self):
+        """Removing the eviction term must be what lets it in, so the reason is visible.
 
-        assert ACP_BACKEND_CODEX not in _bg_runtime_backends()
+        A name-based exclusion would read the same from the outside and silently
+        admit the next non-evicting harness.
+        """
+        import inspect
 
-    def test_on_a_codex_resume_is_attempted_without_a_local_transcript(self, monkeypatch):
+        from kiro_crew import session as session_mod
+
+        source = inspect.getsource(session_mod._bg_runtime_backends)
+        assert "ACP_BACKENDS_SESSION_EVICTION" in source
+        assert "CODEX" not in source.upper()
+
+    def test_the_teardown_verb_is_the_one_the_sets_are_reasoning_about(self):
+        """Pinned here so the sets above cannot be justified by a verb that changed."""
+        adapter = harness_for(ACP_BACKEND_CODEX)
+        assert adapter.teardown.method == METHOD_CANCEL
+        assert adapter.teardown.notification is True
+
+
+class TestResumeNeedsNoLocalTranscript:
+    def test_a_codex_resume_is_attempted_without_a_local_file(self):
         """codex keeps its own session records, so there is no file to pre-check.
 
         A resume path that stats ``<kiro home>/sessions/cli/<sid>.json`` can never
-        say yes for codex — that file is written only for the kiro family — so
+        say yes for codex -- that file is written only for the kiro family -- so
         gating the load on it drops the conversation on every reopen and starts a
-        fresh session instead. Membership in
-        ``ACP_BACKENDS_HARNESS_OWNED_SESSIONS`` is what ``AcpClient`` reads for the
-        same decision, and it is what the runtime path reads too.
+        fresh session instead.
         """
-        monkeypatch.setenv(ENV_CODEX_ACP_RUNTIME, "1")
         assert ACP_BACKEND_CODEX in ACP_BACKENDS_HARNESS_OWNED_SESSIONS
         assert ACP_BACKEND_KIRO not in ACP_BACKENDS_HARNESS_OWNED_SESSIONS
-
-    def test_the_switch_is_read_per_call_not_cached_at_import(self, monkeypatch):
-        """A value frozen at import answers for whichever ran first: gateway or test."""
-        monkeypatch.delenv(ENV_CODEX_ACP_RUNTIME, raising=False)
-        assert codex_runs_on_acp_runtime() is False
-        monkeypatch.setenv(ENV_CODEX_ACP_RUNTIME, "1")
-        assert codex_runs_on_acp_runtime() is True
-        monkeypatch.delenv(ENV_CODEX_ACP_RUNTIME, raising=False)
-        assert codex_runs_on_acp_runtime() is False
-
-
-class TestTheCapabilitySetsKeepTheirMembers:
-    """The switch widens a derived ANSWER; it must not edit the vocabulary."""
-
-    def test_the_shipped_runtime_set_is_unchanged(self, monkeypatch):
-        monkeypatch.setenv(ENV_CODEX_ACP_RUNTIME, "1")
-        assert ACP_BACKENDS_ACP_RUNTIME == frozenset({ACP_BACKEND_KIRO, ACP_BACKEND_KAS})
-
-    def test_session_sharing_does_not_follow_the_switch(self, monkeypatch):
-        """Running on AcpRuntime is necessary for sharing, never sufficient.
-
-        KAS is the precedent: on the runtime, excluded from sharing until keep-aware
-        teardown lands. codex is in the same position, and a switch that granted
-        sharing as a side effect would hand multiplexed subagent sessions to a host
-        whose teardown verb cannot erase a transcript.
-        """
-        monkeypatch.setenv(ENV_CODEX_ACP_RUNTIME, "1")
-        assert ACP_BACKEND_CODEX not in ACP_BACKENDS_SESSION_SHARING
-        assert _build_provider(ACP_BACKEND_CODEX).is_session_sharing_eligible is False
 
 
 def _effort_provider(backend: str, model: str) -> AcpProvider:
@@ -945,21 +1012,20 @@ class TestTheEffortChannelIsReadFromItsOwnTable:
 
     ``_apply_initial_effort`` skips the live push for the kiro family because kiro
     reads effort from the spawn-time ``cli.json`` overlay instead. Spelling that
-    skip as "is this backend on AcpRuntime?" makes the two facts one, and the
-    switch then silently drops a codex session's configured effort: codex is a
-    member of ``ACP_BACKENDS_EFFORT_VIA_CONFIG_OPTION`` and
-    ``session/set_config_option`` is the only channel it has, so nothing else
-    would apply the level and only a manual ``change_effort`` recovers it.
-    Harness-parity H6 is the rule these assertions hold the gate to.
+    skip as "is this backend on AcpRuntime?" makes the two facts one, and a codex
+    session's configured effort is then dropped silently: codex is a member of
+    ``ACP_BACKENDS_EFFORT_VIA_CONFIG_OPTION`` and ``session/set_config_option`` is
+    the only channel it has, so nothing else would apply the level and only a
+    manual ``change_effort`` recovers it. Harness-parity H6 is the rule these
+    assertions hold the gate to.
     """
 
     @pytest.mark.asyncio
-    async def test_on_the_runtime_codex_still_gets_its_configured_effort(self, monkeypatch):
-        monkeypatch.setenv(ENV_CODEX_ACP_RUNTIME, "1")
+    async def test_on_the_runtime_codex_still_gets_its_configured_effort(self):
         provider = _effort_provider(ACP_BACKEND_CODEX, "gpt-5.6-codex")
         provider._effort_per_model = {"gpt-5.6-codex": "high"}
-        # The premise of the assertion below: the switch does put codex on the
-        # runtime, so a runtime-membership gate would return here.
+        # The premise of the assertion below: codex IS on the shared runtime, so a
+        # runtime-membership gate would return here and apply nothing.
         assert provider.is_acp_runtime_backend is True
         await provider._apply_initial_effort()
         # The option ID is codex's own spelling, resolved through
@@ -972,9 +1038,8 @@ class TestTheEffortChannelIsReadFromItsOwnTable:
         )
 
     @pytest.mark.asyncio
-    async def test_the_kiro_family_still_takes_effort_from_its_overlay(self, monkeypatch):
-        """The skip the runtime gate was standing in for, held by the channel set."""
-        monkeypatch.setenv(ENV_CODEX_ACP_RUNTIME, "1")
+    async def test_the_kiro_family_still_takes_effort_from_its_overlay(self):
+        """The skip the runtime gate stands in for, held by the channel set instead."""
         for backend in (ACP_BACKEND_KIRO, ACP_BACKEND_KAS):
             provider = _effort_provider(backend, "claude-fable-5")
             provider._effort_per_model = {"claude-fable-5": "high"}

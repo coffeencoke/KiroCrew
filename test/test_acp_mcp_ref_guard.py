@@ -29,6 +29,7 @@ from kiro_crew import agent as agent_mod
 from kiro_crew.acp import client as client_mod
 from kiro_crew.acp import mcp_ref_guard, session_mcp
 from kiro_crew.acp.client import AcpClient
+from kiro_crew.acp.harness.codex import CodexHarness
 from kiro_crew.acp.mcp_ref_guard import warn_unresolved_server_refs
 from kiro_crew.acp.mcp_session_report import (
     NAME_CAP,
@@ -43,6 +44,7 @@ from kiro_crew.agent_sdk.mcp_refs import (
     unresolved_server_refs,
     wire_server_names,
 )
+from kiro_crew.providers.mirrors.codex import codex_projection
 
 _CORE = {"command": "/opt/kirocrew", "args": ["mcp-core"]}
 _CRON = {"command": "/opt/kirocrew", "args": ["mcp-cron"]}
@@ -607,14 +609,53 @@ class TestTheCompositionPath:
         return client
 
     def _compose(self, client: AcpClient) -> list[dict[str, Any]]:
-        """The array the session/new call site builds, then the guard over it."""
+        """The array the client's session/new call site builds, then the guard over it.
+
+        Every backend the CLIENT still composes for. A backend served by the shared
+        runtime composes elsewhere -- see :meth:`_codex_wire`, which is the same two
+        steps on that path.
+        """
         wire = [
             *(client._claude_session_mcp_servers() if client._is_claude else []),
-            *(client._codex_session_mcp_servers() if client._is_codex else []),
         ]
         client._begin_session_report(wire)
         client._guard_unresolved_mcp_refs(wire)
         return wire
+
+    def _codex_wire(self, tmp_path) -> tuple[list[dict[str, Any]], McpSessionReport]:
+        """The array a codex session receives, plus the report the guard wrote into.
+
+        codex is served by AcpRuntime, so its array is composed by the mirror
+        (:func:`codex_projection`, the producer) and then narrowed by the host
+        (:meth:`CodexHarness.session_mcp_servers`, which drops any element whose
+        transport this session's handshake did not advertise). Those two ARE the
+        composition on that path, and the guard question is asked over their result
+        exactly as the client asks it over its own: the detector and the report are
+        provider-neutral, which is what lets one behaviour be pinned on both
+        transports without a second detector.
+
+        The handshake advertises stdio, which every ACP agent must support, so the
+        narrowing keeps what the mirror projected and the finding below is the
+        mirror's withhold rather than a dropped transport.
+        """
+        projected = codex_projection("kirocrew", work_dir=tmp_path).params["mcpServers"]
+        wire = CodexHarness().session_mcp_servers(
+            list(projected), agent_capabilities={"mcpCapabilities": {"stdio": True}}
+        )
+        report = McpSessionReport()
+        report.begin_session(wire)
+        report.record_unresolved_refs(
+            warn_unresolved_server_refs(
+                session_mcp.agent_spec_snapshot("kirocrew", work_dir=tmp_path),
+                wire,
+                backend=ACP_BACKEND_CODEX,
+                agent="kirocrew",
+                # No shared MCP gateway in this session, so the remedy the line
+                # names is the projection rather than stub routing.
+                gateway_enabled=False,
+            )
+        )
+        return wire, report
 
     def test_a_codex_session_records_what_its_mirror_withholds(self, tmp_path, agents_dir, caplog):
         """On a mirrored codex session the finding narrows to the withheld set.
@@ -626,18 +667,22 @@ class TestTheCompositionPath:
         own sentence is then exactly right, the tools are absent from the session.
         Two lines, two jobs: the mirror logs WHY it withheld, and this one records
         that the spec asked for it.
+
+        Driven through the runtime-path composition (:meth:`_codex_wire`), because
+        that is where a codex array is built. The claim under test is unchanged by
+        the transport: what the mirror keeps back, the report names.
         """
         self._spec(
             agents_dir,
             servers={"kirocrew-core": dict(_CORE), "kirocrew-work": dict(_CORE)},
             tools=["@kirocrew-core", "@kirocrew-cron", "@kirocrew-work"],
         )
-        client = self._client(tmp_path, agents_dir, ACP_BACKEND_CODEX)
         with caplog.at_level(logging.WARNING, logger=mcp_ref_guard.__name__):
-            names = {e["name"] for e in self._compose(client)}
+            wire, report = self._codex_wire(tmp_path)
+        names = {e["name"] for e in wire}
         assert {"kirocrew-core", "kirocrew-cron"} <= names
         assert "kirocrew-work" not in names
-        assert client.mcp_session_report().unresolved_refs == ("@kirocrew-work",)
+        assert report.unresolved_refs == ("@kirocrew-work",)
         assert "@kirocrew-work" in caplog.text
 
     def test_a_claude_session_whose_mirror_projects_the_server_is_silent(

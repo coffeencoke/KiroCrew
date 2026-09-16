@@ -202,19 +202,27 @@ Callers: heartbeat callback, taskrunner lesson extraction.
 `get_bg_session()` acquires a `_bg` handle, dispatching by `agent.acp_backend`
 and returning `AcpSessionHandle | _ProviderBgSession`. Dispatch is via
 `_bg_backend_supports_runtime()` — positive membership in
-`_bg_runtime_backends()`, i.e. `ACP_BACKENDS_ACP_RUNTIME & selectable_backends()`,
-never an inequality (harness parity). The intersection is defense-in-depth: a
+`_bg_runtime_backends()` — the intersection of `ACP_BACKENDS_ACP_RUNTIME`,
+`ACP_BACKENDS_SESSION_EVICTION` and `selectable_backends()` — never an
+inequality (harness parity). The selectability term is defense-in-depth: a
 runtime-capable harness that is not operator-selectable must not be spawnable
 here from a config object that skipped the loader's normalisation.
 
-This path reads the frozenset and **not** `acp_runtime_backends()`, so the
-`KIROCREW_CODEX_ACP_RUNTIME` preview switch does not reach it. Background handles
-are the high-churn ones — title generation, suggestions, folders and nav each take
-their own ephemeral `sessionId` — and codex's teardown verb `session/cancel` ends
-the turn without evicting the session from the adapter's map, which on a shared
-process is unbounded growth at a rate the user never controls. The preview is
-scoped to the foreground, where the runtime's age/RSS recycle eventually collects
-the process; codex joins this set only once per-session eviction exists.
+The eviction term is what keeps codex off this path while it runs on the shared
+runtime everywhere else. Background handles are the high-churn ones — title
+generation, suggestions, folders and nav each take their own ephemeral
+`sessionId`, many per conversation, at a rate the user never controls — and
+codex's teardown verb `session/cancel` ends the turn without evicting the
+session from the adapter's map, so on one shared process that is unbounded
+growth. Membership in `ACP_BACKENDS_SESSION_EVICTION` is the claim that a
+teardown verb actually frees one session, and codex is absent from it: measured
+live, a cancelled `sessionId` still answers `session/set_config_option` and
+still serves a `session/prompt` whose `cachedReadTokens` proves the context is
+resident. The adapter does advertise `session/close` and `session/delete`, so
+this is a gap Crew can close by sending one rather than a limit of the harness.
+The foreground accumulates sessions the same way, but at the rate a person opens
+chats, and the runtime's age/RSS recycle collects the process; codex joins this
+set when the teardown Crew sends is one that evicts.
 
 - **runtime-capable backend** (`_bg_runtime_backends()`) — each caller (title
   generation, suggestions, folders, nav) gets its **own** ephemeral `sessionId`

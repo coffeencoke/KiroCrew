@@ -497,22 +497,30 @@ def _get_rss_mb(pid: int) -> float | None:
         return None
 
 
-def _iter_descendant_pids(pid: int) -> list[int]:
+def _iter_descendant_pids(pid: int, max_depth: int | None = None) -> list[int]:
     """Return ``[pid, *descendants]`` (Linux only), best-effort.
 
     Walks ``/proc/<pid>/task/<tid>/children`` breadth-first. Returns ``[pid]``
     when the interface is unavailable. Used so RSS accounting can cover a
     sandbox launcher's exec'd child — see _get_rss_tree_mb().
+
+    ``max_depth`` bounds the walk in generations below *pid*: ``None`` is the
+    whole subtree, ``0`` is *pid* alone, ``1`` adds its direct children. The queue
+    carries each pid's own depth rather than the loop tracking a level, so a
+    process reachable at two depths is counted once, at whichever it is reached
+    first — the same single-visit rule the unbounded walk has.
     """
     order: list[int] = []
     visited: set[int] = set()
-    stack = [pid]
-    while stack:
-        p = stack.pop()
+    queue: list[tuple[int, int]] = [(pid, 0)]
+    while queue:
+        p, depth = queue.pop()
         if p in visited:
             continue
         visited.add(p)
         order.append(p)
+        if max_depth is not None and depth >= max_depth:
+            continue
         try:
             entries = os.listdir(f"/proc/{p}/task")
         except OSError:
@@ -529,7 +537,7 @@ def _iter_descendant_pids(pid: int) -> list[int]:
                 except ValueError:
                     continue
                 if cpid not in visited:
-                    stack.append(cpid)
+                    queue.append((cpid, depth + 1))
     return order
 
 
@@ -617,8 +625,24 @@ def _ps_process_table() -> _ProcessTable | None:
         return table
 
 
-def _get_rss_tree_mb(pid: int) -> float | None:
-    """Sum RSS (MiB) of *pid* and all its descendants, or None if unavailable.
+def _get_rss_tree_mb(pid: int, max_depth: int | None = None) -> float | None:
+    """Sum RSS (MiB) of *pid* and its descendants, or None if unavailable.
+
+    ``max_depth`` bounds the sum in generations below *pid*, for a host that
+    declares one through ``SpawnPlan.rss_depth``. ``None``, the default, is
+    the whole subtree and is what every kiro-family host uses.
+
+    Windows answers None for any bounded request rather than a subtree total. The
+    bound is not available there: the tree is summed through
+    ``proc_rss_tree_mb_for_pid``, whose lineage-VALIDATED walk returns a flat set
+    of genuine descendants with no generation attached, and the naive parent-map
+    walk that would carry depth is the unsafe one that walk exists to avoid.
+    Answering with the subtree instead would judge a bounded host's ceiling
+    against an unbounded measurement — and for a host that declares a bound
+    because its subtree is dominated by a per-session fleet, that reads as a leak
+    on the first session and recycles a healthy process. None is the "unknown, do
+    not judge" answer this probe's caller already handles, so the age ceiling
+    still governs while the RSS ceiling abstains.
 
     On Linux the kirocrew-lite background runtime is spawned through the
     namespace sandbox launcher, which ``fork()``s: ``self._pid`` is the
@@ -637,7 +661,7 @@ def _get_rss_tree_mb(pid: int) -> float | None:
     if sys.platform == "linux":
         total = 0.0
         found = False
-        for p in _iter_descendant_pids(pid):
+        for p in _iter_descendant_pids(pid, max_depth):
             r = _get_rss_mb(p)
             if r is not None:
                 total += r
@@ -645,6 +669,10 @@ def _get_rss_tree_mb(pid: int) -> float | None:
         return total if found else None
 
     if platform_compat.IS_WINDOWS:
+        if max_depth is not None:
+            # See the docstring: no depth-carrying validated walk exists here, and
+            # a subtree total would be judged against a bounded host's ceiling.
+            return None
         # Windows spawns kiro-cli WITHOUT a launcher fork, but it still spawns
         # MCP-server / tool children that can leak. Sum the tree via
         # proc_rss_tree_mb_for_pid, which enumerates descendants through
@@ -669,14 +697,16 @@ def _get_rss_tree_mb(pid: int) -> float | None:
         return None
     total_kib = 0
     visited: set[int] = set()
-    stack = [pid]
-    while stack:
-        p = stack.pop()
+    queue: list[tuple[int, int]] = [(pid, 0)]
+    while queue:
+        p, depth = queue.pop()
         if p in visited:
             continue
         visited.add(p)
         total_kib += rss_kib.get(p, 0)
-        stack.extend(children.get(p, []))
+        if max_depth is not None and depth >= max_depth:
+            continue
+        queue.extend((c, depth + 1) for c in children.get(p, []))
     return total_kib / 1024.0
 
 
@@ -840,6 +870,10 @@ class AcpRuntime:
         # neither threshold means anything before a process exists.
         self._max_age_secs = max_age_secs
         self._max_rss_mb = max_rss_mb
+        # Which processes the ceiling above is measured over. None = the whole
+        # descendant subtree, which is every kiro-family host. The spawn plan carries
+        # a bounded host's depth relative to the exact pid Crew launches.
+        self._max_rss_depth: int | None = None
 
         # session/new + session/load budget — resolved lazily on first use
         # (never in __init__: KiroCrewConfig.load() is a synchronous disk
@@ -1118,7 +1152,7 @@ class AcpRuntime:
                 return None
 
         rss_mb = await asyncio.get_running_loop().run_in_executor(
-            subprocess_executor(), _get_rss_tree_mb, self._pid
+            subprocess_executor(), _get_rss_tree_mb, self._pid, self._max_rss_depth
         )
         if rss_mb is not None and rss_mb > self._max_rss_mb:
             return "rss"
@@ -1410,6 +1444,7 @@ class AcpRuntime:
 
         try:
             plan = await self._resolve_spawn_plan()
+            self._max_rss_depth = plan.rss_depth
             argv = plan.argv
         except _KiroExecutableTrustError as exc:
             raise AcpRuntimeError(str(exc)) from exc

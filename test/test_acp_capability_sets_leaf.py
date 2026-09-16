@@ -44,6 +44,7 @@ from kiro_crew.acp_backends import (
     ACP_BACKENDS_COMPACT,
     ACP_BACKENDS_INTERNAL_SANDBOX,
     ACP_BACKENDS_SEED_LOCAL_SETTINGS,
+    ACP_BACKENDS_SESSION_EVICTION,
     ACP_BACKENDS_SESSION_SHARING,
     ACP_BACKENDS_STEER,
     model_registry_namespace,
@@ -67,6 +68,7 @@ CAPABILITY_SETS = (
     "ACP_BACKENDS_COMPACT",
     "ACP_BACKENDS_INTERNAL_SANDBOX",
     "ACP_BACKENDS_SEED_LOCAL_SETTINGS",
+    "ACP_BACKENDS_SESSION_EVICTION",
     "ACP_BACKENDS_SESSION_SHARING",
     "ACP_BACKENDS_STEER",
 )
@@ -159,11 +161,21 @@ def test_membership_is_unchanged_by_the_move() -> None:
     Opting a harness in is a deliberate edit with evidence (harness-parity H5/H6);
     a relocation is not the place for it.
     """
+    # codex is a member of sharing and of the runtime, and absent from eviction, and
+    # the three pins together are what keep that from reading as one fact. Its
+    # teardown verb leaves the session addressable with its context resident: for a
+    # shared subagent session that persistence is what ``spawn_continue`` needs, and
+    # for an adapter outliving many sessions it is unbounded growth. KAS is the
+    # opposite pairing -- it evicts, and is held out of sharing until a keep-aware
+    # teardown lands -- so no two of these sets may be derived from another.
     assert ACP_BACKENDS_SESSION_SHARING == frozenset({ACP_BACKEND_KIRO})
     assert ACP_BACKENDS_COMPACT == frozenset({ACP_BACKEND_KIRO, ACP_BACKEND_CLAUDE})
     assert ACP_BACKENDS_INTERNAL_SANDBOX == frozenset({ACP_BACKEND_KIRO})
     assert ACP_BACKENDS_STEER == frozenset({ACP_BACKEND_KIRO, ACP_BACKEND_KAS})
-    assert ACP_BACKENDS_ACP_RUNTIME == frozenset({ACP_BACKEND_KIRO, ACP_BACKEND_KAS})
+    assert ACP_BACKENDS_ACP_RUNTIME == frozenset(
+        {ACP_BACKEND_KIRO, ACP_BACKEND_KAS, ACP_BACKEND_CODEX}
+    )
+    assert ACP_BACKENDS_SESSION_EVICTION == frozenset({ACP_BACKEND_KIRO, ACP_BACKEND_KAS})
     assert backends_retired_by_host_logout() == frozenset({ACP_BACKEND_KIRO, ACP_BACKEND_KAS})
     # The provider-advertised-model seams. claude for the spelling fold; codex
     # because its configOptions ``model`` select is the ONLY source of ids the
@@ -243,3 +255,13 @@ def test_acp_runtime_is_a_superset_of_session_sharing() -> None:
     assert ACP_BACKENDS_SESSION_SHARING <= ACP_BACKENDS_ACP_RUNTIME
     assert ACP_BACKEND_KAS in ACP_BACKENDS_ACP_RUNTIME
     assert ACP_BACKEND_KAS not in ACP_BACKENDS_SESSION_SHARING
+    # Sharing is a PROPER subset, and two members of the runtime demonstrate it for
+    # different reasons: KAS is held out pending keep-aware teardown, and codex is
+    # held out because a shared codex subagent's continuation cannot be resolved.
+    # Neither set can therefore be spelled as the other.
+    assert ACP_BACKENDS_SESSION_SHARING != ACP_BACKENDS_ACP_RUNTIME
+    assert ACP_BACKEND_CODEX in ACP_BACKENDS_ACP_RUNTIME
+    assert ACP_BACKEND_CODEX not in ACP_BACKENDS_SESSION_SHARING
+    # And out of eviction as well, which is the harness's own limit rather than
+    # Crew's: the teardown verb Crew sends it frees nothing.
+    assert ACP_BACKEND_CODEX not in ACP_BACKENDS_SESSION_EVICTION
