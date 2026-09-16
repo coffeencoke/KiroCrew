@@ -617,9 +617,18 @@ describe('AppDetailPage — uncovered surfaces', () => {
     await loaded()
 
     fireEvent.click(screen.getByRole('button', { name: /enable/i }))
-    await waitFor(() => expect(enableApp).toHaveBeenCalledWith(NAME))
+    await waitFor(() => expect(enableApp).toHaveBeenCalledWith(NAME, false))
     await waitFor(() => expect(changed.count()).toBeGreaterThan(0))
     changed.stop()
+  })
+
+  it('confirms pending session approval from the detail disclosure', async () => {
+    getApp.mockResolvedValue(installedApp({ enabled: false, sessionApprovalConsentPending: true }))
+    renderDetail()
+    await loaded()
+
+    fireEvent.click(screen.getByRole('button', { name: /enable/i }))
+    await waitFor(() => expect(enableApp).toHaveBeenCalledWith(NAME, true))
   })
 
   it('syncs a gateway-managed app that has no update waiting', async () => {
@@ -630,6 +639,43 @@ describe('AppDetailPage — uncovered surfaces', () => {
     expect(screen.queryByRole('button', { name: /^update$/i })).not.toBeInTheDocument()
     fireEvent.click(screen.getByRole('button', { name: /sync/i }))
     await waitFor(() => expect(updateApp).toHaveBeenCalledWith(NAME))
+  })
+
+  it('says the app is disabled pending consent when an update widens the grant', async () => {
+    getApp
+      .mockResolvedValueOnce(installedApp())
+      .mockResolvedValueOnce(installedApp({
+        enabled: false,
+        sessionApprovalConsentPending: true,
+      }))
+    // The backend left the app disabled because the new version newly asks for
+    // session control; a generic "updated" toast would report success over an
+    // app that just stopped running.
+    updateApp.mockResolvedValue({ ok: true, notice: 'session_approval_reconsent' })
+    renderDetail()
+    await loaded()
+
+    fireEvent.click(screen.getByRole('button', { name: /sync/i }))
+    const notice = await screen.findByText(/newly asks to control your chats/)
+    expect(screen.queryByText(/from the registry\./)).not.toBeInTheDocument()
+    // Warn-styled, not the green success box: the text says the app is disabled.
+    const box = notice.closest('[role="status"]')
+    expect(box).not.toBeNull()
+    expect(box?.className).toContain('bg-warn-subtle')
+    expect(box?.className).not.toContain('bg-ok')
+  })
+
+  it('restores the consent warning after leaving and reopening the page', async () => {
+    getApp.mockResolvedValue(installedApp({
+      enabled: false,
+      sessionApprovalConsentPending: true,
+    }))
+
+    renderDetail()
+    await loaded()
+
+    const notice = await screen.findByText(/newly asks to control your chats/)
+    expect(notice.closest('[role="status"]')).not.toBeNull()
   })
 
   it('reports a failed sync inline and lets the user dismiss it', async () => {
@@ -765,6 +811,7 @@ describe('AppDetailPage — uncovered surfaces', () => {
           cron: true,
           network: true,
           memory: 'read',
+          sessionApproval: true,
         },
         mcpServers: {
           ledgerd: {
@@ -796,6 +843,17 @@ describe('AppDetailPage — uncovered surfaces', () => {
     expect(screen.getByText('Cron: yes')).toBeInTheDocument()
     expect(screen.getByText('Network: yes')).toBeInTheDocument()
     expect(screen.getByText(/Memory:/)).toBeInTheDocument()
+    expect(screen.getByText(/Can approve or deny tool prompts in your chats/)).toBeInTheDocument()
+    expect(screen.getByText('Chat approval modes it can set')).toBeInTheDocument()
+    // Each mode carries the picker's gloss, so "Trust" here cannot be read as
+    // the consent verb.
+    expect(screen.getByText(/checks with you before doing anything/)).toBeInTheDocument()
+    expect(screen.getByText(/In every chat, .* works without asking you first/)).toBeInTheDocument()
+    expect(screen.getByText('sessionApproval')).toBeInTheDocument()
+    expect(screen.getByText('Normal')).toBeInTheDocument()
+    expect(screen.getByText('Reads')).toBeInTheDocument()
+    expect(screen.getByText('Trust (chat mode)')).toBeInTheDocument()
+    expect(screen.getByText('YOLO')).toBeInTheDocument()
 
     expect(screen.getByText('MCP Servers')).toBeInTheDocument()
     expect(screen.getByText('ledgerd')).toBeInTheDocument()

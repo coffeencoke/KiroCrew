@@ -1917,6 +1917,144 @@ class TestCopyAppTree:
         assert (dest / "data" / "state.json").read_text(encoding="utf-8") == '{"k": 1}'
         assert secret.read_text(encoding="utf-8") == "s3cret"
 
+    def test_update_that_adds_session_approval_disables_until_reconsent(
+        self, tmp_path, app_home, monkeypatch
+    ):
+        # Consent is captured at install/enable while the route guard reads the
+        # live manifest, so a version that ADDS the grant must not inherit the
+        # user's earlier "enabled" -- otherwise an update silently widens what
+        # the app may do to their sessions.
+        from kiro_crew.apps import manager as manager_mod
+        from kiro_crew.apps.manager import update_app
+        from kiro_crew.apps.permissions import app_can_manage_session_approvals
+
+        assert install_app(_make_app_source(tmp_path)).ok
+        assert enable_app("test-app").ok
+        assert get_app("test-app")["enabled"] is True
+
+        v2 = _make_app_source(
+            tmp_path / "v2",
+            version="2.0.0",
+            permissions={"sessionApproval": True},
+        )
+        real_copy = manager_mod._copy_app_tree
+        observed_grants = []
+
+        def _copy_with_permission_probe(source, dest):
+            real_copy(source, dest)
+            observed_grants.append(app_can_manage_session_approvals("test-app"))
+
+        monkeypatch.setattr(manager_mod, "_copy_app_tree", _copy_with_permission_probe)
+        result = update_app(v2)
+        assert result.ok, result.error
+        assert observed_grants == [False]
+        assert "session approval" in result.message
+        # The UI branches on the structured notice, not on the prose.
+        assert result.notice == "session_approval_reconsent"
+        assert result.to_dict()["notice"] == "session_approval_reconsent"
+        assert "code" not in result.to_dict()
+        assert get_app("test-app")["enabled"] is False
+        assert get_app("test-app")["version"] == "2.0.0"
+        assert get_app("test-app")["sessionApprovalConsentPending"] is True
+
+    def test_update_keeping_session_approval_stays_enabled(self, tmp_path, app_home):
+        # The grant was already declared when the user enabled the app, so a
+        # refresh that keeps it is not a new request.
+        from kiro_crew.apps.manager import update_app
+
+        assert install_app(
+            _make_app_source(tmp_path, permissions={"sessionApproval": True})
+        ).ok
+        assert enable_app("test-app").ok
+        v2 = _make_app_source(
+            tmp_path / "v2",
+            version="2.0.0",
+            permissions={"sessionApproval": True},
+        )
+        result = update_app(v2)
+        assert result.ok, result.error
+        assert result.notice == ""
+        assert get_app("test-app")["enabled"] is True
+
+    def test_self_registration_that_adds_session_approval_is_disabled(self, app_home):
+        # Self-managed apps re-register on every launch and author their own
+        # manifest, so a manifest that newly asks for session control must not
+        # inherit the always-enabled default -- that would be a self-grant.
+        assert register_external_app("ext-keypad", "1.0.0", "Keypad").ok
+        assert get_app("ext-keypad")["enabled"] is True
+
+        result = register_external_app(
+            "ext-keypad",
+            "1.1.0",
+            "Keypad",
+            manifest_data={
+                "name": "ext-keypad",
+                "version": "1.1.0",
+                "permissions": {"sessionApproval": True},
+            },
+        )
+        assert result.ok, result.error
+        assert result.notice == "session_approval_reconsent"
+        assert get_app("ext-keypad")["enabled"] is False
+
+    def test_first_self_registration_with_session_approval_starts_disabled(self, app_home):
+        result = register_external_app(
+            "ext-keypad",
+            "1.0.0",
+            "Keypad",
+            manifest_data={
+                "name": "ext-keypad",
+                "version": "1.0.0",
+                "permissions": {"sessionApproval": True},
+            },
+        )
+        assert result.ok, result.error
+        assert result.notice == "session_approval_reconsent"
+        assert get_app("ext-keypad")["enabled"] is False
+        assert get_app("ext-keypad")["sessionApprovalConsentPending"] is True
+        # Only a disclosure surface may clear pending consent.
+        blocked = enable_app("ext-keypad")
+        assert not blocked.ok
+        assert blocked.error_code == "session_approval_consent_required"
+        assert get_app("ext-keypad")["sessionApprovalConsentPending"] is True
+        assert enable_app("ext-keypad", session_approval_consent=True).ok
+        assert get_app("ext-keypad")["enabled"] is True
+        assert get_app("ext-keypad")["sessionApprovalConsentPending"] is False
+
+    def test_self_registration_keeping_session_approval_stays_enabled(self, app_home):
+        manifest = {
+            "name": "ext-keypad",
+            "version": "1.0.0",
+            "permissions": {"sessionApproval": True},
+        }
+        assert register_external_app("ext-keypad", "1.0.0", "Keypad", manifest_data=manifest).ok
+        assert enable_app("ext-keypad", session_approval_consent=True).ok
+        result = register_external_app(
+            "ext-keypad", "1.0.1", "Keypad", manifest_data={**manifest, "version": "1.0.1"}
+        )
+        assert result.ok, result.error
+        assert result.notice == ""
+        assert get_app("ext-keypad")["enabled"] is True
+
+    def test_update_of_disabled_app_adding_session_approval_requires_consent(
+        self, tmp_path, app_home
+    ):
+        # A disabled app can be enabled later, so a new grant still needs consent.
+        from kiro_crew.apps.manager import update_app
+
+        assert install_app(_make_app_source(tmp_path)).ok
+        assert get_app("test-app")["enabled"] is False
+        v2 = _make_app_source(
+            tmp_path / "v2",
+            version="2.0.0",
+            permissions={"sessionApproval": True},
+        )
+        result = update_app(v2)
+        assert result.ok, result.error
+        assert get_app("test-app")["enabled"] is False
+        assert result.notice == "session_approval_reconsent"
+        assert get_app("test-app")["sessionApprovalConsentPending"] is True
+
     def test_local_update_clears_prior_registry_provenance(self, tmp_path, app_home):
         from kiro_crew.apps.manager import (
             _read_installed,

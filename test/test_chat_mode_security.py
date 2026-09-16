@@ -21,6 +21,7 @@ paths, where the contract is "never even called").
 
 from __future__ import annotations
 
+import asyncio
 import threading
 from unittest.mock import MagicMock, patch
 
@@ -29,7 +30,7 @@ from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
 from chat_test_helpers import _make_state
 
-from kiro_crew.dashboard.chat_handlers import api_chat_mode
+from kiro_crew.dashboard.chat_handlers import api_chat_mode, api_chat_slot_approve
 from kiro_crew.safety_override import (
     reset_singleton,
 )
@@ -53,6 +54,21 @@ def _make_mode_app(state) -> web.Application:
     app = web.Application(middlewares=[_dashboard_owner_request])
     app["state"] = state
     app.router.add_post("/api/chat/mode", api_chat_mode)
+    return app
+
+
+@web.middleware
+async def _app_request(request: web.Request, handler):
+    request["app"] = "crew-keyboard"
+    request["user"] = ""
+    return await handler(request)
+
+
+def _make_app_token_mode_app(state) -> web.Application:
+    app = web.Application(middlewares=[_app_request])
+    app["state"] = state
+    app.router.add_post("/api/chat/mode", api_chat_mode)
+    app.router.add_post("/api/chat/slots/{slot}/approve", api_chat_slot_approve)
     return app
 
 
@@ -83,6 +99,10 @@ def _client(state) -> TestClient:
     return TestClient(TestServer(_make_mode_app(state)))
 
 
+def _app_client(state) -> TestClient:
+    return TestClient(TestServer(_make_app_token_mode_app(state)))
+
+
 class _FakeOverride:
     """Recording stand-in for the SafetyOverride singleton.
 
@@ -94,8 +114,13 @@ class _FakeOverride:
 
     def __init__(self, *, active: bool = False) -> None:
         self.active = active
+        self.activate_calls: list[str] = []
         self.deactivate_calls: list[str] = []
         self.is_declared = False
+
+    def activate(self, source: str) -> _FakeOverride:
+        self.activate_calls.append(source)
+        return self
 
     def deactivate(self, source: str) -> None:
         self.deactivate_calls.append(source)
@@ -103,6 +128,186 @@ class _FakeOverride:
 
     def is_active(self) -> bool:
         return self.active
+
+
+# ── app permission: explicit grant, live slot scope ──
+
+
+@pytest.mark.asyncio
+async def test_app_without_session_approval_grant_is_denied(state) -> None:
+    state.get_or_create_slot("s1")
+    with patch(
+        "kiro_crew.apps.permissions.app_can_manage_session_approvals",
+        return_value=False,
+    ):
+        async with _app_client(state) as client:
+            resp = await client.post("/api/chat/mode", json={"mode": "trust", "slot": "s1"})
+            assert resp.status == 403
+            assert (await resp.json())["code"] == "session_approval_not_granted"
+    assert state._slots["s1"]._trust is False
+
+
+@pytest.mark.parametrize(
+    ("mode", "expected_trust", "expected_trust_reads"),
+    [
+        ("normal", False, False),
+        ("trust_reads", False, True),
+        ("trust", True, False),
+    ],
+)
+@pytest.mark.asyncio
+async def test_app_with_grant_can_set_user_slot_mode(
+    state,
+    mode: str,
+    expected_trust: bool,
+    expected_trust_reads: bool,
+) -> None:
+    slot = state.get_or_create_slot("s1")
+    if mode == "normal":
+        slot._trust = True
+        slot._trust_reads = True
+    with patch(
+        "kiro_crew.apps.permissions.app_can_manage_session_approvals",
+        return_value=True,
+    ):
+        async with _app_client(state) as client:
+            resp = await client.post("/api/chat/mode", json={"mode": mode, "slot": "s1"})
+            assert resp.status == 200
+    assert slot._trust is expected_trust
+    assert slot._trust_reads is expected_trust_reads
+
+
+@pytest.mark.asyncio
+async def test_app_with_grant_can_enable_yolo(state) -> None:
+    state.get_or_create_slot("s1")
+    with patch(
+        "kiro_crew.apps.permissions.app_can_manage_session_approvals",
+        return_value=True,
+    ):
+        async with _app_client(state) as client:
+            resp = await client.post("/api/chat/mode", json={"mode": "yolo"})
+            assert resp.status == 200
+    assert real_safety_override().is_active() is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("body", [{"mode": "trust"}, {"mode": "trust", "slot": ""}])
+async def test_app_mode_change_requires_explicit_slot(state, body: dict) -> None:
+    # A missing slot and an EMPTY slot both normalize to the all-slots path, so
+    # both must be refused for an app caller -- ``""`` once slipped past an
+    # ``is None`` check and trusted every session.
+    state.get_or_create_slot("s1")
+    state.get_or_create_slot("s2")
+    audit = MagicMock()
+    with (
+        patch(
+            "kiro_crew.apps.permissions.app_can_manage_session_approvals",
+            return_value=True,
+        ),
+        patch("kiro_crew.dashboard.chat_handlers.sel", return_value=audit),
+    ):
+        async with _app_client(state) as client:
+            resp = await client.post("/api/chat/mode", json=body)
+            assert resp.status == 400
+            assert (await resp.json())["code"] == "slot_required"
+    audit.log_api_access.assert_any_call(
+        caller="crew-keyboard",
+        operation="chat_mode",
+        outcome="allowed",
+        source="app_isolation",
+        resources="permissions.sessionApproval",
+    )
+    assert state._slots["s1"]._trust is False
+    assert state._slots["s2"]._trust is False
+
+
+@pytest.mark.asyncio
+async def test_app_with_grant_can_resolve_user_slot_approval(state) -> None:
+    slot = state.get_or_create_slot("s1")
+    future = asyncio.get_running_loop().create_future()
+    slot._approval_futures["req-1"] = future
+    audit = MagicMock()
+    with (
+        patch(
+            "kiro_crew.apps.permissions.app_can_manage_session_approvals",
+            return_value=True,
+        ),
+        patch("kiro_crew.dashboard.chat_handlers.sel", return_value=audit),
+    ):
+        async with _app_client(state) as client:
+            resp = await client.post(
+                "/api/chat/slots/s1/approve",
+                json={"action": "approved", "request_id": "req-1"},
+            )
+            assert resp.status == 200
+    assert future.result() == "approved"
+    assert audit.log_api_access.call_args.kwargs["caller"] == "app:crew-keyboard"
+
+
+@pytest.mark.asyncio
+async def test_app_yolo_policy_denial_is_audited_as_the_app(state) -> None:
+    state.get_or_create_slot("s1")
+    override = _FakeOverride()
+    audit = MagicMock()
+    with (
+        patch(
+            "kiro_crew.apps.permissions.app_can_manage_session_approvals",
+            return_value=True,
+        ),
+        patch(
+            "kiro_crew.dashboard.chat_handlers.safety_override",
+            return_value=override,
+        ),
+        patch(
+            "kiro_crew.dashboard.chat_handlers.yolo_policy_permits",
+            return_value=False,
+        ),
+        patch("kiro_crew.dashboard.chat_handlers.sel", return_value=audit),
+    ):
+        async with _app_client(state) as client:
+            resp = await client.post(
+                "/api/chat/slots/s1/approve",
+                json={"action": "yolo", "request_id": "req-1"},
+            )
+            assert resp.status == 403
+    assert audit.log_api_access.call_args.kwargs["caller"] == "app:crew-keyboard"
+
+
+@pytest.mark.asyncio
+async def test_app_trust_does_not_persist_linked_channel_trust(state) -> None:
+    slot = state.get_or_create_slot("s1")
+    slot._slack_channel = "ch1"
+    channel = MagicMock(trusted=False)
+    state.channel_manager = MagicMock(_channels={"ch1": channel})
+    with patch(
+        "kiro_crew.apps.permissions.app_can_manage_session_approvals",
+        return_value=True,
+    ):
+        async with _app_client(state) as client:
+            resp = await client.post("/api/chat/mode", json={"mode": "trust", "slot": "s1"})
+            assert resp.status == 200
+    assert slot._trust is True
+    assert channel.trusted is False
+    channel._save.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_app_normal_does_not_clear_linked_channel_trust(state) -> None:
+    slot = state.get_or_create_slot("s1")
+    slot._trust = True
+    slot._slack_channel = "ch1"
+    channel = MagicMock(trusted=True)
+    state.channel_manager = MagicMock(_channels={"ch1": channel})
+    with patch(
+        "kiro_crew.apps.permissions.app_can_manage_session_approvals",
+        return_value=True,
+    ):
+        async with _app_client(state) as client:
+            resp = await client.post("/api/chat/mode", json={"mode": "normal", "slot": "s1"})
+            assert resp.status == 200
+    assert slot._trust is False
+    assert channel.trusted is True
+    channel._save.assert_not_called()
 
 
 # ── defect 1: trust_reads must not widen on an unknown slot ──

@@ -59,6 +59,7 @@ from kiro_crew.apps.manager import list_apps as list_installed_apps
 from kiro_crew.apps.manager import (
     registry_source_repository,
     set_app_provenance,
+    set_session_approval_consent_pending,
     update_app,
 )
 from kiro_crew.apps.manifest import (
@@ -7287,6 +7288,21 @@ async def install_from_registry(
             outcome = startup_refusal
             return outcome
 
+        projected_manifest = entry.get("manifest")
+        projected_permissions = (
+            projected_manifest.get("permissions") if isinstance(projected_manifest, dict) else None
+        )
+        installed_permissions = manifest_data.get("permissions")
+        first_install_undisclosed_session_approval = bool(
+            not was_installed
+            and isinstance(installed_permissions, dict)
+            and installed_permissions.get("sessionApproval") is True
+            and not (
+                isinstance(projected_permissions, dict)
+                and projected_permissions.get("sessionApproval") is True
+            )
+        )
+
         # Step 4: Register with KiroCrew
         if is_self_managed:
             # Pre-register with manifest from the cloned repo so the app
@@ -7346,6 +7362,9 @@ async def install_from_registry(
                     "(self-managed)"
                 ),
             }
+            notice = getattr(reg_result, "notice", "")
+            if isinstance(notice, str) and notice:
+                outcome["notice"] = notice
             return outcome
 
         # Kirocrew-managed: copy to ~/.kiro/crew/apps/ and register resources
@@ -7366,6 +7385,23 @@ async def install_from_registry(
                 result = await asyncio.to_thread(update_app, str(app_source))
             else:
                 result = await asyncio.to_thread(install_app, str(app_source))
+        if (
+            result.ok
+            and first_install_undisclosed_session_approval
+            and set_session_approval_consent_pending(result.name)
+        ):
+            result.notice = "session_approval_reconsent"
+            result.message = (
+                f"installed {result.name}; disabled because its cloned manifest "
+                "requests session approval control that the registry row did not disclose"
+            )
+            sel().log_api_access(
+                caller="app_install_from_registry",
+                operation="session_approval_undisclosed",
+                outcome="disabled",
+                resources=f"name={result.name!r}",
+                error="cloned manifest added undisclosed permissions.sessionApproval",
+            )
         log_lines.append(result.message or result.error or "done")
 
         # Record the source marker plus structured provenance, so a later update
@@ -7417,6 +7453,10 @@ async def install_from_registry(
             "message": result.message,
             "error": result.error,
         }
+        if result.notice:
+            # e.g. ``session_approval_reconsent``: the app was left disabled on
+            # purpose and the routes must neither start it nor report plain success.
+            outcome["notice"] = result.notice
         return outcome
 
     except Exception as exc:

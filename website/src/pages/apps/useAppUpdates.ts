@@ -83,8 +83,12 @@ export function useAppUpdates({
   // shape). Not `runUpdate` itself — that catch-all resolves on failure and
   // would make the gate report success over a failed update.
   const retryUpdate = async (name: string) => {
-    await api.updateApp(name)
+    const updateResult = await api.updateApp(name)
     announceAppsChanged()
+    if (updateResult?.notice === 'session_approval_reconsent') {
+      updateApp(name)
+      return
+    }
     setSuccess(i18nT('pages.appsPage.updated_app', { count: 1 }))
   }
 
@@ -103,8 +107,12 @@ export function useAppUpdates({
     setUpdatePending(name)
     setError('')
     try {
-      await api.updateApp(name)
+      const updateResult = await api.updateApp(name)
       announceAppsChanged()
+      if (updateResult?.notice === 'session_approval_reconsent') {
+        updateApp(name)
+        return
+      }
       // An in-place sync is the one action here whose success is otherwise
       // INVISIBLE: re-copying a source directory usually carries the same
       // version, so the card re-renders byte-identical and the dev cannot tell
@@ -134,10 +142,14 @@ export function useAppUpdates({
     setError('')
     const failed: string[] = []
     let succeeded = 0
+    const consentNeeded: string[] = []
     for (let i = 0; i < targets.length; i++) {
       try {
-        await api.updateApp(targets[i])
+        const updateResult = await api.updateApp(targets[i])
         succeeded += 1
+        if (updateResult?.notice === 'session_approval_reconsent') {
+          consentNeeded.push(targets[i])
+        }
       } catch {
         failed.push(targets[i])
       }
@@ -152,7 +164,8 @@ export function useAppUpdates({
     // run with zero successes changed nothing worth refreshing.
     if (succeeded > 0) announceAppsChanged()
     if (failed.length) setError(i18nT('pages.appsPage.failed_to_update', { names: failed.join(', ') }))
-    else setSuccess(i18nT('pages.appsPage.updated_app', { count: targets.length }))
+    if (consentNeeded.length) updateApp(consentNeeded[0])
+    else if (!failed.length) setSuccess(i18nT('pages.appsPage.updated_app', { count: targets.length }))
   }
 
   return { updatingAll, updatePending, runUpdate, updateAll }
