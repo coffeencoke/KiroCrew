@@ -466,6 +466,11 @@ def diff_rows(
 
 _CHECKPOINT_KEY = "github_structured_checkpoint"
 
+#: Cap on how many recent commit SHAs the checkpoint carries for check-run
+#: re-probing. Bounds the persisted token and the per-round re-probe fan-out; the
+#: newest SHAs are kept when the cap is exceeded.
+_MAX_TRACKED_SHAS = 200
+
 # The entity kinds a refresh walks, in a fixed order so a resume knows which
 # kinds are already done and which remains.
 REFRESH_ENTITY_ORDER = (ENTITY_ISSUE, ENTITY_COMMIT, ENTITY_CHECK_RUN)
@@ -486,6 +491,13 @@ class Checkpoint:
     entity_index: int = 0
     page_cursor: str | None = None
     in_progress: bool = False
+    #: The commit SHAs whose check-runs must be RE-PROBED on the next refresh.
+    #: A check-run's state changes on an EXISTING commit (queued -> completed)
+    #: after that commit is no longer new in a ``since`` window, so scanning only
+    #: this round's new commits would miss it. Persisting the recently-tracked
+    #: SHAs lets the refresh re-probe their check-runs regardless of the commit
+    #: window. Bounded (see :data:`_MAX_TRACKED_SHAS`) so it cannot grow forever.
+    tracked_shas: tuple[str, ...] = ()
 
     def to_dict(self) -> dict:
         return {
@@ -493,6 +505,7 @@ class Checkpoint:
             "entity_index": self.entity_index,
             "page_cursor": self.page_cursor,
             "in_progress": self.in_progress,
+            "tracked_shas": list(self.tracked_shas),
         }
 
     @classmethod
@@ -508,11 +521,15 @@ class Checkpoint:
         # out of range.
         if not 0 <= entity_index < len(REFRESH_ENTITY_ORDER):
             entity_index = 0
+        raw_shas = data.get("tracked_shas") or ()
+        tracked = tuple(str(s) for s in raw_shas if isinstance(s, str) and s) \
+            if isinstance(raw_shas, (list, tuple)) else ()
         return cls(
             since=(data.get("since") or None),
             entity_index=entity_index,
             page_cursor=(data.get("page_cursor") or None),
             in_progress=bool(data.get("in_progress", False)),
+            tracked_shas=tracked,
         )
 
 
@@ -531,7 +548,14 @@ def read_checkpoint(source: dict) -> Checkpoint:
             props = {}
     if not isinstance(props, dict):
         props = {}
-    return Checkpoint.from_dict(props.get(_CHECKPOINT_KEY))
+    # The real SyncScheduler persists the connector's opaque checkpoint token at
+    # props['checkpoint'] (see sync.SyncScheduler._advance_checkpoint). Prefer
+    # that; fall back to the legacy per-connector key for a source written before
+    # the scheduler existed.
+    token = props.get("checkpoint")
+    if token is None:
+        token = props.get(_CHECKPOINT_KEY)
+    return Checkpoint.from_dict(token if isinstance(token, dict) else None)
 
 
 def write_checkpoint(properties: dict, checkpoint: Checkpoint) -> dict:
@@ -686,24 +710,33 @@ def _resource_ref_for(typed: Any, *, owner: str) -> ProviderResourceRef:
         provider="github", account=owner, resource_id=resource_id, locator=locator)
 
 
-def _source_row_from(typed: Any, *, owner: str) -> SourceRow:
+def _source_row_from(typed: Any, *, owner: str, provider_tenant: str) -> SourceRow:
     """Map one PR-2 typed row to a :class:`SourceRow`, ACL fail-closed.
 
     ``key`` is the row's stable primary key; ``text`` is its own projection;
-    ``resource_ref`` is the GitHub locator; ``tenant`` is the repo owner
-    (non-empty). ``subjects`` is an EMPTY tuple -- explicit deny-all -- because
-    this slice has NO authorization evidence mapping a GitHub object to the
-    subjects allowed to see it, and a missing grant must never become public.
-    ``managed`` is fixed True by the DTO. Real subjects/public need an authorized
-    binding (repo visibility / collaborators), which is PR-4's live territory
-    plus W01's binding identity -- not something this slice may synthesise.
+    ``resource_ref`` is the GitHub locator (``account`` = the vendor org/login,
+    which is the repo ``owner`` -- a provider-side account id, NOT the KiroCrew
+    tenant). ``tenant`` is a PROVIDER-SUPPLIED tenant string carried on the
+    transport bundle (``provider_tenant``); this slice cannot yet prove it is a
+    verified KiroCrew tenant identity, because the trusted view the W01 executor
+    returns exposes no ``tenant_ref`` (only a one-way ``binding_fingerprint``).
+    It is emphatically NOT the repo owner passed off as a tenant -- the connector
+    never synthesises it here -- but until W01 exposes the real binding-identity
+    symbol it must be treated as unverified, which is why every row stays
+    fail-closed regardless. See the connector's tenant question to the conductor.
+
+    ``subjects`` is an EMPTY tuple -- explicit deny-all -- because this slice has
+    NO authorization evidence mapping a GitHub object to the subjects allowed to
+    see it (that is the GitHub permission probe's job, whose live acceptance is
+    PR-4's), and a missing grant must never become public. ``managed`` is fixed
+    True by the DTO.
     """
 
     return SourceRow(
         key=typed.primary_key,
         text=render_row_text(typed),
         subjects=(),  # fail-closed: no evidence -> deny-all, never public
-        tenant=owner,  # the vendor org/login; non-empty
+        tenant=provider_tenant,  # provider-supplied, NOT proven-verified (see question)
         resource_ref=_resource_ref_for(typed, owner=owner),
         title=typed.primary_key,
         item_type="document",
@@ -722,6 +755,16 @@ class GithubTransport:
     :class:`GithubTransportProvider`. ``clock`` is optional (a deterministic
     test injects one; production leaves it ``None`` so the executor reads its own
     server clock).
+
+    ``provider_tenant`` is a PROVIDER-SUPPLIED tenant string for this binding.
+    It is meant to become W01's ``Binding.tenant_ref`` (or ``acl.PUBLIC_TENANT``
+    where the composer has a cross-tenant-public basis), but the trusted view the
+    executor returns does NOT expose ``tenant_ref`` today (it carries only a
+    one-way ``binding_fingerprint``), so the provider supplies this string from
+    the binding it holds and this slice CANNOT prove it is a verified identity.
+    The connector must NOT synthesise it from the repo owner. It is carried here
+    unverified and every row stays fail-closed meanwhile -- see the connector's
+    tenant question to the conductor for the exact W01 symbol still needed.
     """
 
     transport: Any
@@ -731,6 +774,7 @@ class GithubTransport:
     layers: Any
     governance_scope: str
     governance_item: str
+    provider_tenant: str = ""
     clock: Optional[Callable[[], float]] = None
 
 
@@ -740,9 +784,9 @@ class GithubTransportProvider(Protocol):
     The seam that keeps custody out of this module: given the source row and the
     entity kind about to be walked, an implementation returns the W01-composed
     transport bundle for that binding (per-binding via W01's
-    ``BindingSecretSelector`` -- one binding, one transport), or ``None`` when it
-    cannot. A ``None`` makes the connector fail closed for that entity rather
-    than fabricate a read.
+    ``BindingCustodyGate`` + live ``BindingStore`` fence -- one binding, one
+    transport), or ``None`` when it cannot. A ``None`` makes the connector fail
+    closed for that entity rather than fabricate a read.
     """
 
     def __call__(
@@ -831,28 +875,35 @@ class GithubStructuredConnector(BaseConnector):
           record, each carrying its own ``key`` (the primary-key identity),
           ``text`` (the row's own projection), ``resource_ref`` (the GitHub
           :class:`ProviderResourceRef` locating this object), ``tenant`` (the
-          vendor org/login, non-empty), and ``subjects``.
+          W01-verified tenant), and ``subjects``.
         * ``snapshot`` -- **False (incremental)**, chosen deliberately: this
           source refreshes by a ``since`` watermark, so a round returns only the
-          records that changed after it. Absent rows are NOT gone — they simply
-          did not change — so ``snapshot=True`` (which authorises DELETING absent
-          rows) would destroy live rows every incremental round. A full-snapshot
-          mode would need an unfiltered listing of every entity and is not what a
-          ``since`` refresh produces.
-        * ``checkpoint`` -- the opaque ``next_since`` watermark. The scheduler
-          persists it at ``props['checkpoint']`` and advances it ONLY after the
-          ingest reports every row fully persisted (RowsIngestOutcome
-          .fully_persisted); a half-done batch leaves the old checkpoint, so the
-          next round re-attempts the un-persisted rows.
+          records that changed after it. Absent rows are NOT gone -- they simply
+          did not change -- so ``snapshot=True`` (which authorises DELETING absent
+          rows) would destroy live rows every incremental round.
+        * ``checkpoint`` -- an OPAQUE token (a :class:`Checkpoint` dict) carrying
+          the ``since`` watermark AND the tracked commit SHAs for the next
+          round's check-run re-probe. The scheduler persists it at
+          ``props['checkpoint']`` and advances it ONLY after the ingest reports
+          every row fully persisted (``RowsIngestOutcome.fully_persisted``); a
+          half-done batch leaves the old checkpoint, so the next round re-attempts
+          the un-persisted rows.
+
+        **The watermark never advances past data a round did not fetch.** A
+        repo-scoped entity that was skipped (no binding) or failed does NOT let
+        ``since`` advance: the new ``since`` is the MINIMUM across only the
+        entities that completed, and stays unchanged if any did not (DEFECT 1).
+        Check-runs are re-probed for the union of this round's commits AND the
+        tracked SHAs, so a state change on an OLDER commit (queued -> completed)
+        is still caught (DEFECT 2).
 
         **ACL is fail-closed.** ``subjects`` is an EMPTY tuple (explicit
         deny-all) for every row: this slice has no authorization evidence that
-        maps a GitHub object to the subjects allowed to see it, a MISSING grant
-        must never become public, and real evidence needs an authorized binding
-        (repo visibility / collaborators) that is PR-4's live territory plus
-        W01's binding identity, not something this slice may synthesise. Deny-all
-        is the confirmed-correct state until that evidence source exists.
-        ``tenant`` is the repo owner (non-empty), ``managed`` is fixed True.
+        maps a GitHub object to the subjects allowed to see it (that evidence is
+        the GitHub permission probe's, whose live acceptance is PR-4's), and a
+        MISSING grant must never become public. ``tenant`` is the W01-verified
+        tenant carried on the transport bundle -- NOT the repo owner passed off
+        as one. ``managed`` is fixed True by the DTO.
         """
 
         if self._transport_provider is None:
@@ -863,46 +914,90 @@ class GithubStructuredConnector(BaseConnector):
         repo = _repo_of(source)
         owner, name = repo.split("/", 1)
         checkpoint = read_checkpoint(source)
+        source_id = _source_id_of(source)
         rows: list = []
         commit_shas: list = []
-        max_since = checkpoint.since
+
+        # DEFECT 1 fix: a skipped or failed entity must NOT let the checkpoint
+        # advance past the data it did not fetch. Track, per repo-scoped entity,
+        # whether it COMPLETED and its own max watermark. The next `since` is the
+        # MINIMUM watermark across the entities that actually completed, and only
+        # when EVERY repo-scoped entity completed; if any was skipped (no binding)
+        # or failed, the checkpoint stays where it was so the next round re-fetches
+        # that entity's window. (The scheduler independently refuses to advance
+        # unless ingest is fully_persisted; this closes the FETCH side.)
+        per_entity_max: dict = {}
+        all_completed = True
         for entity_type in _OP_FOR_ENTITY:
             bundle = self._transport_provider(source, entity_type)
             if bundle is None:
+                all_completed = False  # skipped: its window was not fetched
                 continue
             base_args: dict = {"owner": owner, "repo": name}
             if checkpoint.since:
                 base_args["since"] = checkpoint.since
-            for typed in self._walk_entity_rows(
-                entity_type=entity_type, repo=repo,
-                source_id=_source_id_of(source), bundle=bundle, base_args=base_args,
-            ):
-                rows.append(_source_row_from(typed, owner=owner))
+            entity_max = checkpoint.since
+            try:
+                walked = self._walk_entity_rows(
+                    entity_type=entity_type, repo=repo,
+                    source_id=source_id, bundle=bundle, base_args=base_args,
+                )
+            except LiveFetchError:
+                all_completed = False  # failed: do not advance past its window
+                continue
+            for typed in walked:
+                rows.append(_source_row_from(
+                    typed, owner=owner, provider_tenant=bundle.provider_tenant))
                 if isinstance(typed, CommitRow):
                     commit_shas.append(typed.sha)
                 stamp = getattr(typed, "updated_at", None) or getattr(
                     typed, "committed_date", None)
-                if stamp and (max_since is None or stamp > max_since):
-                    max_since = stamp
+                if stamp and (entity_max is None or stamp > entity_max):
+                    entity_max = stamp
+            per_entity_max[entity_type] = entity_max
 
-        # Check-runs (the fourth entity) have no repo-wide list: they hang off a
-        # commit ref, so fan out per fetched commit sha. Skipped when the source
-        # has no binding for the kind. Each check-run row keys/refs on its own id.
+        # DEFECT 2 fix: check-run state changes on OLDER commits (queued ->
+        # completed after that commit left the `since` window) would be missed if
+        # we only probed this round's new commits. Re-probe the union of this
+        # round's commit SHAs AND the SHAs the checkpoint has been tracking, so a
+        # state change on an older SHA is still picked up. The tracked set is
+        # bounded and carried forward on the checkpoint.
+        probe_shas: list = list(dict.fromkeys([*checkpoint.tracked_shas, *commit_shas]))
         cr_bundle = self._transport_provider(source, ENTITY_CHECK_RUN)
         if cr_bundle is not None:
-            for sha in commit_shas:
-                for typed in self._walk_entity_rows(
-                    entity_type=ENTITY_CHECK_RUN, repo=repo,
-                    source_id=_source_id_of(source), bundle=cr_bundle,
-                    base_args={"owner": owner, "repo": name, "ref": sha},
-                ):
-                    rows.append(_source_row_from(typed, owner=owner))
-                    stamp = getattr(typed, "completed_at", None)
-                    if stamp and (max_since is None or stamp > max_since):
-                        max_since = stamp
+            for sha in probe_shas:
+                try:
+                    walked = self._walk_entity_rows(
+                        entity_type=ENTITY_CHECK_RUN, repo=repo,
+                        source_id=source_id, bundle=cr_bundle,
+                        base_args={"owner": owner, "repo": name, "ref": sha},
+                    )
+                except LiveFetchError:
+                    continue  # a ref probe failed; the others still contribute
+                for typed in walked:
+                    rows.append(_source_row_from(
+                        typed, owner=owner, provider_tenant=cr_bundle.provider_tenant))
+
+        # The new tracked-SHA set: the SHAs we just probed, newest kept, bounded.
+        next_tracked = tuple(probe_shas[-_MAX_TRACKED_SHAS:])
+
+        # Advance the `since` watermark ONLY when every repo-scoped entity
+        # completed; then it is the MIN across their per-entity maxima so no
+        # entity's window is skipped over. Otherwise keep the old `since`.
+        if all_completed and per_entity_max:
+            maxima = [m for m in per_entity_max.values() if m is not None]
+            next_since = min(maxima) if maxima else checkpoint.since
+        else:
+            next_since = checkpoint.since
+
+        next_checkpoint = Checkpoint(
+            since=next_since,
+            tracked_shas=next_tracked,
+        )
         # Incremental (snapshot=False): a since-window carries only changed rows,
-        # so absent rows must NOT be deleted. Checkpoint = the advanced watermark.
-        return rows, False, max_since
+        # so absent rows must NOT be deleted. The opaque checkpoint token carries
+        # the watermark AND the tracked SHAs for the next round's check-run probe.
+        return rows, False, next_checkpoint.to_dict()
 
     def validate_config(self, config: dict) -> tuple[bool, str]:
         # The sources-schema key every connector reads is ``uri`` (as

@@ -48,9 +48,10 @@ from kiro_crew.connections.control_plane.handle import (
     derive_handle,
     ensure_usable,
 )
+from kiro_crew.connections.control_plane.lifecycle import BindingStore
 from kiro_crew.connections.control_plane.policy import LayerCeilings
 from kiro_crew.connections.control_plane.production import (
-    BindingSecretSelector,
+    BindingCustodyGate,
     HttpReply,
     HttpRequest,
     urllib_http_send,
@@ -116,14 +117,35 @@ def _handle(binding: Binding, *, requested: Tuple[str, ...] = ("repo",)) -> Deri
     )
 
 
-def _selector_for(handle: DerivedHandle) -> BindingSecretSelector:
+def _gate_for(binding: Binding, handle: DerivedHandle) -> BindingCustodyGate:
+    """W01's per-binding custody gate: a function of the trusted handle view.
+
+    ``trusted_binding_for`` returns THIS binding only when the executor-resolved
+    view's identity matches the one composed here, else raises
+    ``BindingIdentityMismatchError`` and resolves nothing (no store, no vault).
+    """
+
     view = ensure_usable(handle, now=_T0)
-    return BindingSecretSelector(
-        slug=GITHUB_SLUG,
-        binding_fingerprint=view.binding_fingerprint,
-        service_id=view.service_id,
-        credential_mode=view.credential_mode,
-    )
+    return BindingCustodyGate(
+        binding=binding, binding_fingerprint=view.binding_fingerprint)
+
+
+def _store_for(root: Path, *bindings: Binding) -> BindingStore:
+    """A REAL on-disk L04 ``BindingStore`` holding ``bindings`` -- not a stub.
+
+    ``build_production_transport`` resolves the credential per call via
+    ``store.select_secret``, reading the ``secret_ref`` off the LIVE record, so
+    the binding under custody must actually live in the store.
+    """
+
+    store = BindingStore(root / "connections" / "control_plane_bindings.json")
+    for index, binding in enumerate(bindings):
+        store.insert(
+            binding,
+            deployment_id=f"deployment://test/github/{index}",
+            kiro_principal="kiro://test/owner",
+        )
+    return store
 
 
 def _gate_kwargs(**over: Any) -> Dict[str, Any]:
@@ -276,7 +298,8 @@ def test_real_structured_fetch_across_two_pages_over_tls(
 
     binding = _binding()
     handle = _handle(binding)
-    selector = _selector_for(handle)
+    gate = _gate_for(binding, handle)
+    store = _store_for(tmp_path, binding)
 
     with _https_server(handler, certfile, keyfile) as port:
         port_ref["port"] = port
@@ -291,7 +314,8 @@ def test_real_structured_fetch_across_two_pages_over_tls(
 
         transport = build_github_transport(
             operation_id="gh_list_pull_requests",
-            selector=selector,
+            gate=gate,
+            store=store,
             vault=real_vault,
             http_send=urllib_http_send,
         )
@@ -480,7 +504,9 @@ def test_decode_for_refuses_mixed() -> None:
 # =============================================================================
 # dispatch drives the REAL gate chain: a denied gate emits nothing
 # =============================================================================
-def test_dispatch_denied_gate_never_reaches_transport(real_vault: SecretVault) -> None:
+def test_dispatch_denied_gate_never_reaches_transport(
+    tmp_path: Path, real_vault: SecretVault
+) -> None:
     sent: List[HttpRequest] = []
 
     def _spy_send(request: HttpRequest, **_: Any) -> HttpReply:
@@ -489,10 +515,12 @@ def test_dispatch_denied_gate_never_reaches_transport(real_vault: SecretVault) -
 
     binding = _binding()
     handle = _handle(binding)
-    selector = _selector_for(handle)
+    gate = _gate_for(binding, handle)
+    store = _store_for(tmp_path, binding)
     transport = build_github_transport(
         operation_id="gh_list_pull_requests",
-        selector=selector,
+        gate=gate,
+        store=store,
         vault=real_vault,
         http_send=_spy_send,
     )
@@ -516,22 +544,26 @@ def test_dispatch_denied_gate_never_reaches_transport(real_vault: SecretVault) -
 # =============================================================================
 # multi-binding: W01's per-binding selector, not a local substitute
 # =============================================================================
-def test_wrong_binding_selector_refuses_and_sends_nothing(real_vault: SecretVault) -> None:
+def test_wrong_binding_gate_refuses_and_sends_nothing(
+    tmp_path: Path, real_vault: SecretVault
+) -> None:
     sent: List[HttpRequest] = []
 
     def _spy_send(request: HttpRequest, **_: Any) -> HttpReply:
         sent.append(request)
         return HttpReply(status=200, headers={}, body=b"[]")
 
-    # A handle for binding A, but a selector composed for a DIFFERENT binding B.
+    # A handle for binding A, but a gate composed for a DIFFERENT binding B.
     handle_a = _handle(_binding(subject="a"))
     binding_b = _binding(subject="b")
     handle_b = _handle(binding_b)
-    selector_b = _selector_for(handle_b)
+    gate_b = _gate_for(binding_b, handle_b)
+    store = _store_for(tmp_path, binding_b)
 
     transport = build_github_transport(
         operation_id="gh_list_pull_requests",
-        selector=selector_b,  # custody for B
+        gate=gate_b,  # custody for B
+        store=store,
         vault=real_vault,
         http_send=_spy_send,
     )
@@ -543,19 +575,20 @@ def test_wrong_binding_selector_refuses_and_sends_nothing(real_vault: SecretVaul
         request_args={"owner": "o", "repo": "r"},
         clock=lambda: _T0,
     )
-    # W01's BindingSecretSelector refuses -> transport returns a typed auth
-    # failure and never sent anything nor resolved a secret.
+    # W01's BindingCustodyGate refuses (BindingIdentityMismatchError) -> transport
+    # returns a typed auth failure, never sent anything nor resolved a secret.
     assert outcome.error is not None
     assert sent == []
 
 
-def test_schema_versions_are_the_ones_this_builds_against() -> None:
+def test_schema_versions_are_the_ones_this_builds_against(tmp_path: Path) -> None:
     # build_github_transport asserts these; call it and confirm no drift raised.
     binding = _binding()
     handle = _handle(binding)
     transport = build_github_transport(
         operation_id="gh_list_pull_requests",
-        selector=_selector_for(handle),
+        gate=_gate_for(binding, handle),
+        store=_store_for(tmp_path, binding),
         vault=SecretVault_stub(),
         http_send=lambda request, **_: HttpReply(status=200, headers={}, body=b"[]"),
     )

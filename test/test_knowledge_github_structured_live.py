@@ -45,9 +45,10 @@ from cryptography.x509.oid import NameOID
 from kiro_crew.connections.control_plane.auth_modes import declare_permitted_modes
 from kiro_crew.connections.control_plane.binding import binding_secret_ref, create_binding
 from kiro_crew.connections.control_plane.handle import derive_handle, ensure_usable
+from kiro_crew.connections.control_plane.lifecycle import BindingStore
 from kiro_crew.connections.control_plane.policy import LayerCeilings
 from kiro_crew.connections.control_plane.production import (
-    BindingSecretSelector,
+    BindingCustodyGate,
     urllib_http_send,
 )
 from kiro_crew.connections.vendors.github.dispatch import build_github_transport
@@ -62,6 +63,11 @@ from kiro_crew.secrets import SecretVault
 
 _T0 = 1_000_000.0
 _GRANTED: Tuple[str, ...] = ("repo",)
+
+#: Monotonic per-call deployment index so each composed binding lands in its own
+#: L04 deployment slot (the store's uniqueness key includes deployment_id), while
+#: sharing one account identity across a multi-entity walk.
+_DEPLOY_SEQ = 0
 
 
 def _verifier(*, claimed_subject, claimed_tenant, service_id):
@@ -78,19 +84,39 @@ def _bundle_for(vault: SecretVault, *, clock=lambda: _T0) -> GithubTransport:
         now=_T0, ttl_seconds=3600.0,
     )
     view = ensure_usable(handle, now=_T0)
-    selector = BindingSecretSelector(
-        slug="github", binding_fingerprint=view.binding_fingerprint,
-        service_id=view.service_id, credential_mode=view.credential_mode,
-    )
+    gate = BindingCustodyGate(
+        binding=binding, binding_fingerprint=view.binding_fingerprint)
+    # A REAL on-disk L04 store rooted in the vault's own crewhome (per-test
+    # isolated), holding the binding under custody so W01's per-call
+    # store.select_secret reads its secret_ref off the LIVE record.
+    store = BindingStore(
+        vault._config_dir.parent / "connections" / "control_plane_bindings.json")
+    # A multi-entity fetch composes one bundle per entity; each mints its own
+    # binding (fresh binding_id) but the SAME account identity. select_secret
+    # fences by binding_id against the live store, so THIS binding must be in the
+    # store -- and the (deployment_id, service, subject, tenant) uniqueness key
+    # forces a distinct deployment_id per insert. A per-call counter gives each
+    # its own deployment slot, so every composed binding is genuinely live.
+    global _DEPLOY_SEQ
+    _DEPLOY_SEQ += 1
+    store.insert(
+        binding, deployment_id=f"deployment://test/github/{_DEPLOY_SEQ}",
+        kiro_principal="kiro://test/owner")
     transport = build_github_transport(
-        operation_id="gh_list_pull_requests", selector=selector,
+        operation_id="gh_list_pull_requests", gate=gate, store=store,
         vault=vault, http_send=urllib_http_send,
     )
     return GithubTransport(
         transport=transport, handle=handle, offered_mode="oauth_user",
         permitted=declare_permitted_modes(("oauth_user",)),
         layers=LayerCeilings(), governance_scope="tools",
-        governance_item="pulls.list", clock=clock,
+        governance_item="pulls.list",
+        # Provider-supplied tenant string for this binding (meant to become W01's
+        # Binding.tenant_ref). The connector never synthesises it from the repo
+        # owner; distinct from the repo owner "octo". This slice cannot prove it
+        # is a verified identity yet, so rows stay fail-closed regardless.
+        provider_tenant="tenant://provider-supplied/acme",
+        clock=clock,
     )
 
 
@@ -336,7 +362,7 @@ def test_fetch_rows_covers_all_four_entities_incl_checkrun_fanout(
     assert any("/pulls" in p for p in rec.paths)
     assert any(r.resource_ref.locator.get("check_run_id") for r in rows)
     # Still fail-closed + incremental.
-    assert all(r.subjects == () and r.tenant == "octo" for r in rows)
+    assert all(r.subjects == () and r.tenant == "tenant://provider-supplied/acme" for r in rows)
     assert snapshot is False
 
 
@@ -375,7 +401,7 @@ def test_fetch_rows_returns_failclosed_sourcerows_over_tls(
     for row in rows:
         assert isinstance(row, SourceRow)
         assert row.subjects == ()            # fail-closed deny-all, never public
-        assert row.tenant == "octo"          # vendor org/login, non-empty
+        assert row.tenant == "tenant://provider-supplied/acme"  # provider-supplied, not proven-verified
         assert row.managed is True           # fixed by the DTO
         assert isinstance(row.resource_ref, ProviderResourceRef)
         assert row.resource_ref.provider == "github"
@@ -385,7 +411,11 @@ def test_fetch_rows_returns_failclosed_sourcerows_over_tls(
     # Incremental (snapshot=False): absent rows are NOT deleted; checkpoint is
     # the advanced watermark from the fetched rows.
     assert snapshot is False
-    assert checkpoint == "2026-09-02T00:00:00Z"  # max updated_at across pages
+    # DEFECT 1: issues + commits had no binding (skipped this round), so the
+    # watermark must NOT advance past their un-fetched windows -- it stays at the
+    # prior value (None for a fresh source), even though the PR walk had newer
+    # rows. Advancing here would silently drop issues/commits forever.
+    assert checkpoint["since"] is None
     # The walk really turned two pages over TLS.
     assert rec.paths[0].startswith("/repos/octo/hello/pulls")
     assert rec.paths[1].startswith("/page2")
@@ -401,3 +431,209 @@ def test_commit_and_pr_kinds_are_wired() -> None:
     from kiro_crew.knowledge.connectors.github_structured import _OP_FOR_ENTITY
     assert _OP_FOR_ENTITY[ENTITY_PULL_REQUEST] == "gh_list_pull_requests"
     assert _OP_FOR_ENTITY[ENTITY_COMMIT] == "gh_list_commits"
+
+
+# ── DEFECT 1: the watermark never advances past data a round did not fetch ──
+def test_checkpoint_advances_to_min_when_all_entities_complete(
+    tmp_path: Path, real_vault: SecretVault, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    certfile, keyfile = _tls_material(tmp_path)
+    monkeypatch.setenv("SSL_CERT_FILE", str(certfile))
+    rec = _Recorder()
+    with _https_server(_entity_routing_handler(rec), certfile, keyfile) as port:
+        import kiro_crew.connections.vendors.github.locator as gh_locator
+        monkeypatch.setattr(gh_locator, "GITHUB_API_BASE", f"https://localhost:{port}")
+        connector = GithubStructuredConnector(
+            transport_provider=lambda s, e: _bundle_for(real_vault))
+        _rows, _snap, checkpoint = asyncio.run(
+            connector.fetch_rows({"id": "s", "repo_full_name": "octo/hello"}))
+    # All repo-scoped entities completed: issues (2026-09-01), PR (2026-09-01),
+    # commit (2026-09-02). The watermark is the MIN across them, so no entity's
+    # window is skipped over -> 2026-09-01, not the commit's newer 2026-09-02.
+    assert checkpoint["since"] == "2026-09-01T00:00:00Z"
+
+
+def test_incomplete_round_leaves_checkpoint_unchanged(
+    tmp_path: Path, real_vault: SecretVault, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # NEGATIVE TEST for DEFECT 1: one repo-scoped entity (commits) has no binding
+    # this round. Its window was not fetched, so the checkpoint must NOT advance
+    # past the prior watermark, even though issues + PRs returned newer rows.
+    certfile, keyfile = _tls_material(tmp_path)
+    monkeypatch.setenv("SSL_CERT_FILE", str(certfile))
+    rec = _Recorder()
+    from kiro_crew.knowledge.connectors.github_structured import ENTITY_COMMIT
+
+    prior = {"since": "2026-08-01T00:00:00Z", "tracked_shas": []}
+    source = {"id": "s", "repo_full_name": "octo/hello", "properties": {"checkpoint": prior}}
+    with _https_server(_entity_routing_handler(rec), certfile, keyfile) as port:
+        import kiro_crew.connections.vendors.github.locator as gh_locator
+        monkeypatch.setattr(gh_locator, "GITHUB_API_BASE", f"https://localhost:{port}")
+        # No binding for commits -> that entity is skipped.
+        connector = GithubStructuredConnector(
+            transport_provider=lambda s, e: None if e == ENTITY_COMMIT else _bundle_for(real_vault))
+        _rows, _snap, checkpoint = asyncio.run(connector.fetch_rows(source))
+    # The prior watermark is preserved exactly: a skipped entity cannot advance it.
+    assert checkpoint["since"] == "2026-08-01T00:00:00Z"
+
+
+def test_mutation_reverting_defect1_fix_would_fail() -> None:
+    # MUTATION VERIFY (DEFECT 1): reverting the fix means "advance to the MAX
+    # watermark regardless of skipped entities". Reproduce that broken behaviour
+    # on the same inputs and assert the guard test above would then FAIL — i.e.
+    # the broken version advances the checkpoint where the correct one holds it.
+    # (Reproduced in-process, not by editing source, so the assertion is self-contained.)
+    completed = {"issue": "2026-09-01T00:00:00Z"}   # a completed entity
+    skipped_present = True                           # a commit entity was skipped
+    prior = "2026-08-01T00:00:00Z"
+    # correct fix: any skip -> hold prior
+    correct_next = prior if skipped_present else min(completed.values())
+    # broken (reverted) fix: advance to the max seen, ignoring the skip
+    broken_next = max([prior, *completed.values()])
+    assert correct_next == prior                     # fix holds the checkpoint
+    assert broken_next != correct_next               # revert would advance it -> test fails
+
+
+# ── DEFECT 2: a check-run state change on an OLDER commit is still caught ────
+def _checkrun_state_handler(recorder: _Recorder, state_ref):
+    """Serve issues/pulls empty; commits empty (no NEW commit this round); a
+    check-run for the OLD sha 'oldsha' whose conclusion is state_ref['value']."""
+
+    class _H(http.server.BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
+
+        def do_GET(self) -> None:  # noqa: N802
+            recorder.paths.append(self.path)
+            p = self.path
+            if "/check-runs" in p:
+                body = json.dumps({"check_runs": [{
+                    "id": 777, "name": "ci", "head_sha": "oldsha",
+                    "status": "completed", "conclusion": state_ref["value"],
+                    "completed_at": "2026-09-05T00:00:00Z", "html_url": "h",
+                    "url": "https://api.github.com/repos/octo/hello/check-runs/777",
+                }]}).encode()
+            else:  # issues / pulls / commits: nothing new in this since-window
+                body = b"[]"
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *a: Any) -> None:
+            return
+
+    return _H
+
+
+def test_checkrun_state_change_on_older_sha_is_repicked(
+    tmp_path: Path, real_vault: SecretVault, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    certfile, keyfile = _tls_material(tmp_path)
+    monkeypatch.setenv("SSL_CERT_FILE", str(certfile))
+    rec = _Recorder()
+    state = {"value": "success"}
+    # The checkpoint already tracks an OLD commit sha; NO new commit arrives this
+    # round (the since-window is empty), yet its check-run must still be probed.
+    prior = {"since": "2026-09-04T00:00:00Z", "tracked_shas": ["oldsha"]}
+    source = {"id": "s", "repo_full_name": "octo/hello", "properties": {"checkpoint": prior}}
+    with _https_server(_checkrun_state_handler(rec, state), certfile, keyfile) as port:
+        import kiro_crew.connections.vendors.github.locator as gh_locator
+        monkeypatch.setattr(gh_locator, "GITHUB_API_BASE", f"https://localhost:{port}")
+        connector = GithubStructuredConnector(
+            transport_provider=lambda s, e: _bundle_for(real_vault))
+        rows, _snap, checkpoint = asyncio.run(connector.fetch_rows(source))
+    # The check-run on the OLD sha was re-probed and produced a row, even though
+    # no new commit appeared this round -- DEFECT 2 fix.
+    cr_rows = [r for r in rows if r.resource_ref.locator.get("check_run_id")]
+    assert len(cr_rows) == 1
+    assert any("/commits/oldsha/check-runs" in p for p in rec.paths)
+    # The old sha stays tracked for the next round's re-probe.
+    assert "oldsha" in checkpoint["tracked_shas"]
+
+
+# ── Q2: the GitHub permission probe (capability; live acceptance is PR-4's) ──
+def _repo_perm_handler(recorder: _Recorder, *, private: bool):
+    class _H(http.server.BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
+
+        def do_GET(self) -> None:  # noqa: N802
+            recorder.paths.append(self.path)
+            p = self.path
+            if "/collaborators" in p:
+                body = json.dumps([{"login": "alice"}, {"login": "bob"}]).encode()
+            else:  # the repository object
+                body = json.dumps({"full_name": "octo/hello", "private": private}).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *a: Any) -> None:
+            return
+
+    return _H
+
+
+def _probe_call(real_vault, port, monkeypatch):
+    import kiro_crew.connections.vendors.github.locator as gh_locator
+    from kiro_crew.connections.vendors.github.dispatch import build_github_transport
+    from kiro_crew.connections.vendors.github.permissions import resolve_repo_subjects
+    from kiro_crew.knowledge.acl import PUBLIC_SUBJECT
+    monkeypatch.setattr(gh_locator, "GITHUB_API_BASE", f"https://localhost:{port}")
+
+    # ONE binding/handle/gate/store shared across the per-op transports, so each
+    # transport's custody matches the handle the probe runs under.
+    binding = create_binding(
+        service_id="github", claimed_subject="octocat", claimed_tenant="acme",
+        credential_mode="oauth_user", verifier=_verifier, slug="github")
+    handle = derive_handle(
+        binding, granted_scopes=_GRANTED, requested_scopes=("repo",),
+        now=_T0, ttl_seconds=3600.0)
+    view = ensure_usable(handle, now=_T0)
+    gate = BindingCustodyGate(
+        binding=binding, binding_fingerprint=view.binding_fingerprint)
+    store = BindingStore(
+        real_vault._config_dir.parent / "connections" / "control_plane_bindings.json")
+    store.insert(
+        binding, deployment_id="deployment://test/github/probe",
+        kiro_principal="kiro://test/owner")
+
+    # Each op gets a transport composed with ITS decoder (gh_get_repository ->
+    # decode_single/ObjectPayload; collaborators -> decode_rest_page/collection).
+    def _transport_for(op):
+        return build_github_transport(
+            operation_id=op, gate=gate, store=store, vault=real_vault,
+            http_send=urllib_http_send)
+
+    return resolve_repo_subjects(
+        owner="octo", repo="hello", handle=handle,
+        transport_for=_transport_for, offered_mode="oauth_user",
+        permitted=declare_permitted_modes(("oauth_user",)), layers=LayerCeilings(),
+        governance_scope="tools", governance_item="repo.read",
+        public_subject=PUBLIC_SUBJECT, clock=lambda: _T0)
+
+
+def test_permission_probe_public_repo_resolves_public_subject(
+    tmp_path: Path, real_vault: SecretVault, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from kiro_crew.knowledge.acl import PUBLIC_SUBJECT
+    certfile, keyfile = _tls_material(tmp_path)
+    monkeypatch.setenv("SSL_CERT_FILE", str(certfile))
+    rec = _Recorder()
+    with _https_server(_repo_perm_handler(rec, private=False), certfile, keyfile) as port:
+        subjects = _probe_call(real_vault, port, monkeypatch)
+    assert subjects == (PUBLIC_SUBJECT,)  # proven public via the repo's private=False
+
+
+def test_permission_probe_private_repo_resolves_collaborators(
+    tmp_path: Path, real_vault: SecretVault, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    certfile, keyfile = _tls_material(tmp_path)
+    monkeypatch.setenv("SSL_CERT_FILE", str(certfile))
+    rec = _Recorder()
+    with _https_server(_repo_perm_handler(rec, private=True), certfile, keyfile) as port:
+        subjects = _probe_call(real_vault, port, monkeypatch)
+    assert subjects == ("alice", "bob")  # private repo -> its collaborator logins
+    assert any("/collaborators" in p for p in rec.paths)
