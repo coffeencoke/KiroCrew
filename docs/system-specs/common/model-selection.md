@@ -91,6 +91,11 @@ the cheaper model's output as the one they asked for.
 - The predicate is only meaningful where the advertised ids share a namespace with the
   id being tested, and callers gate on that. Comparing ids across two harnesses'
   namespaces calls every legitimate model unusable (harness-parity invariant `H12`).
+- Dashboard role and member ACP pin validation share `_validate_role_model` and
+  `_active_advertised_ids`. Member pins supply the selected namespace, so the
+  newest matching provider's advertised list supplies entitlement evidence.
+  Calls without a namespace retain the existing first-provider behavior.
+  No matching advertised list still means entitlement is unknown.
 
 ## The one allowed concrete fallback
 

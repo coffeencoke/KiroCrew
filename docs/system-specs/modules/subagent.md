@@ -6,6 +6,28 @@ The subagent module (`kiro_crew/subagent.py`) spawns isolated background agents 
 
 Supports `on_tool_approval` callback for interactive tool approval (routed through gateway's approval system in Normal/Trust modes).
 
+Admission resolves the provider factory's crew identity, including its existing
+agent-name convention, and captures `crew_agent` and `acp_backend` alongside the
+model and reasoning effort. Explicit member dispatch uses that same path.
+These settings survive the admission queue and
+retry paths. Member-bound and backend-pinned runs use dedicated processes, so a
+worker cannot inherit its parent's harness from a shared runtime. The protected
+run record stores execution settings for continuation; editable `state.json`
+fields are display hints and cannot change the resumed backend.
+
+The primary HTTP spawn, retry, and direct app SDK boundaries run
+`prepare_spawn_execution` off-loop before calling synchronous `spawn`. Named-agent
+model discovery can scan and read agent files; admission consumes the prepared
+settings without repeating that discovery. Preparation failures still pass through
+admission's rejection and batch-accounting path. Captured retries and continuations
+retain their backend (including explicit Kiro), model and effort without discovery.
+Direct synchronous callers retain the synchronous preparation fallback.
+Continuations forward their protected record as already prepared execution;
+legacy records without execution fields retain their factory defaults and never
+trigger fresh member discovery during synchronous admission. Queue entries retain
+the prepared record even when its backend is unset, so draining a legacy
+continuation preserves that behavior.
+
 Private member memory is a durable run identity. `spawn_run(crew=...)` resolves
 the target member's template and V2 store together; an ordinary spawn inherits
 the calling session's recorded store. Admission and provider allocation both
