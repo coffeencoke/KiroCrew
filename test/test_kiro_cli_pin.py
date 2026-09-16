@@ -26,13 +26,16 @@ from pathlib import Path
 
 import pytest
 
+# One cached read of the package, shared by every AST ratchet in this suite.
+from source_corpus import parsed_candidates, src_root
+
 # The coverage module owns the `_update` harness: a git-checkout project dir with
 # git stubbed by argv prefix. Reused rather than copied so the two stay one.
 from test_cli_server_more_coverage import _GitStub, git_checkout  # noqa: F401
 
 from kiro_crew import cli_server, diagnostics, kiro_cli
 
-_SRC_ROOT = Path(kiro_cli.__file__).resolve().parent
+_SRC_ROOT = src_root()
 
 # Captured at import, before any fixture rebinds the module attribute: the
 # end-to-end tests below want the REAL resolver against a fake home and PATH.
@@ -351,57 +354,119 @@ _SPAWN_FUNCS = {
     "create_subprocess_exec",
 }
 
+#: Constants the package spells the bare name through. A spawn whose argv0 is
+#: one of these names is the same shape as the literal, just harder to grep.
+_BARE_NAME_CONSTANTS = {"KIRO_CLI_BIN", "KIRO_CLI_NAME"}
 
-def _bare_kiro_cli_spawns(tree: ast.AST) -> list[int]:
-    """Line numbers of spawn calls whose argv0 is the literal ``"kiro-cli"``.
+#: Bare-name sites the guard SEES but this ratchet still admits, as
+#: ``<path>::<function>``. All are interactive: they run under an operator's
+#: own ``kirocrew doctor`` / ``kirocrew setup`` on a TTY, where the inherited
+#: ``PATH`` is the documented default (see ``resolve_kiro_cli``) and the
+#: exposure the pin closes — an unattended or click-reachable spawn — does not
+#: apply. Shrink-only: a fixed site must be deleted here or the test fails,
+#: and a new site anywhere is refused outright.
+_KNOWN_INTERACTIVE_SITES = frozenset(
+    {
+        # `kirocrew doctor` sign-in row: which(KIRO_CLI_BIN) probe, then
+        # [KIRO_CLI_BIN, "whoami"].
+        "cli_doctor.py::_kiro_cli_signed_in",
+        # `kirocrew doctor` dependency + connectivity rows: which(KIRO_CLI_BIN),
+        # then [KIRO_CLI_BIN, "--version"].
+        "cli_doctor.py::_doctor",
+        # `kirocrew setup` prerequisite notice: which(KIRO_CLI_BIN), no spawn.
+        "cli_setup.py::_ensure_prerequisites",
+    }
+)
 
-    Covers the ``subprocess.*`` list-argv shape (``run(["kiro-cli", ...])``)
-    and the ``asyncio.create_subprocess_exec("kiro-cli", ...)`` varargs shape.
-    A ``shutil.which("kiro-cli")`` existence probe is flagged too: the
-    probe-then-discard + bare-argv0 pair is one shape, and the probe's answer
-    is never what ``exec`` resolves.
+
+def _spells_bare_name(node: ast.AST) -> bool:
+    """Whether ``node`` is the literal ``"kiro-cli"`` or a constant that names it."""
+    if isinstance(node, ast.Constant):
+        return node.value == "kiro-cli"
+    if isinstance(node, ast.Name):
+        return node.id in _BARE_NAME_CONSTANTS
+    if isinstance(node, ast.Attribute):
+        return node.attr in _BARE_NAME_CONSTANTS
+    return False
+
+
+def _bare_kiro_cli_spawns(tree: ast.AST) -> list[tuple[int, str]]:
+    """``(line, enclosing function)`` of spawn calls whose argv0 is the bare name.
+
+    Covers the ``subprocess.*`` list-argv shape (``run(["kiro-cli", ...])``),
+    the ``asyncio.create_subprocess_exec("kiro-cli", ...)`` varargs shape, and
+    both spellings of the name — the literal and the ``KIRO_CLI_BIN`` /
+    ``KIRO_CLI_NAME`` constants. A ``shutil.which(<name>)`` existence probe is
+    flagged too: the probe-then-discard + bare-argv0 pair is one shape, and the
+    probe's answer is never what ``exec`` resolves. The enclosing function is
+    ``<module>`` for a module-level call.
     """
-    hits: list[int] = []
-    for node in ast.walk(tree):
-        if not isinstance(node, ast.Call) or not node.args:
-            continue
-        func = node.func
-        name = func.attr if isinstance(func, ast.Attribute) else getattr(func, "id", "")
-        first = node.args[0]
-        if name == "which":
-            if isinstance(first, ast.Constant) and first.value == "kiro-cli":
-                hits.append(node.lineno)
-            continue
-        if name not in _SPAWN_FUNCS:
-            continue
-        if isinstance(first, (ast.List, ast.Tuple)) and first.elts:
-            first = first.elts[0]
-        if isinstance(first, ast.Constant) and first.value == "kiro-cli":
-            hits.append(node.lineno)
-    return hits
+    hits: list[tuple[int, str]] = []
+
+    def _scan(body: ast.AST, owner: str) -> None:
+        for node in ast.walk(body):
+            if not isinstance(node, ast.Call) or not node.args:
+                continue
+            func = node.func
+            name = func.attr if isinstance(func, ast.Attribute) else getattr(func, "id", "")
+            first = node.args[0]
+            if name == "which":
+                if _spells_bare_name(first):
+                    hits.append((node.lineno, owner))
+                continue
+            if name not in _SPAWN_FUNCS:
+                continue
+            if isinstance(first, (ast.List, ast.Tuple)) and first.elts:
+                first = first.elts[0]
+            if _spells_bare_name(first):
+                hits.append((node.lineno, owner))
+
+    # Top-level functions own their whole body (nested defs included); anything
+    # outside one is attributed to the module.
+    functions = [
+        n
+        for n in getattr(tree, "body", [])
+        if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
+    ]
+    for fn in functions:
+        _scan(fn, fn.name)
+    owned = {id(fn) for fn in functions}
+    for node in getattr(tree, "body", []):
+        if id(node) not in owned:
+            _scan(node, "<module>")
+    return sorted(hits)
 
 
 def test_no_bare_name_kiro_cli_spawn_remains_in_the_package() -> None:
     """RED-BEFORE: two sites — ``cli_server._update`` and
-    ``diagnostics._kiro_cli_version``."""
+    ``diagnostics._kiro_cli_version``. The interactive sites in the known set
+    are admitted and counted; any other hit, in either spelling, fails."""
     offenders: list[str] = []
-    for path in sorted(_SRC_ROOT.rglob("*.py")):
+    seen_known: set[str] = set()
+    # Only files that spell the name can hold a match; the corpus pre-filters on
+    # either spelling so this gate parses a handful of modules, not the package.
+    for path, _text, tree in parsed_candidates(require_any=("kiro-cli", *_BARE_NAME_CONSTANTS)):
         if "tests" in path.parts or "test" in path.parts:
             continue
-        try:
-            tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
-        except (SyntaxError, UnicodeDecodeError):
-            continue
-        for lineno in _bare_kiro_cli_spawns(tree):
-            offenders.append(f"{path.relative_to(_SRC_ROOT).as_posix()}:{lineno}")
+        rel = path.relative_to(_SRC_ROOT).as_posix()
+        for lineno, owner in _bare_kiro_cli_spawns(tree):
+            key = f"{rel}::{owner}"
+            if key in _KNOWN_INTERACTIVE_SITES:
+                seen_known.add(key)
+                continue
+            offenders.append(f"{rel}:{lineno} ({owner})")
     assert offenders == [], (
         "bare-name kiro-cli spawns resolve argv0 off the inherited PATH inside "
         "exec; route them through kiro_cli.pin_kiro_cli (sync) or the gateway's "
         f"_pinned_kiro_cli (async): {offenders}"
     )
+    # Shrink-only: an entry whose site has stopped spawning by bare name is debt
+    # that was paid, so the entry must go.
+    stale = _KNOWN_INTERACTIVE_SITES - seen_known
+    assert not stale, f"known-site entries with no remaining bare-name spawn: {sorted(stale)}"
 
 
-def test_structural_guard_sees_both_shapes() -> None:
+def test_structural_guard_sees_every_shape() -> None:
     """The guard's own detector, pinned so a refactor cannot blind it."""
     src = (
         "import shutil, subprocess, asyncio\n"
@@ -411,5 +476,18 @@ def test_structural_guard_sees_both_shapes() -> None:
         'asyncio.create_subprocess_exec("kiro-cli", "--version")\n'
         'subprocess.run([binary, "--version"])\n'
         'shutil.which("git")\n'
+        "def probe():\n"
+        "    shutil.which(KIRO_CLI_BIN)\n"
+        '    subprocess.run([KIRO_CLI_BIN, "whoami"])\n'
+        '    subprocess.run([client.KIRO_CLI_NAME, "--version"])\n'
+        '    subprocess.run([pinned, "--version"])\n'
     )
-    assert _bare_kiro_cli_spawns(ast.parse(src)) == [2, 3, 4, 5]
+    assert _bare_kiro_cli_spawns(ast.parse(src)) == [
+        (2, "<module>"),
+        (3, "<module>"),
+        (4, "<module>"),
+        (5, "<module>"),
+        (9, "probe"),
+        (10, "probe"),
+        (11, "probe"),
+    ]

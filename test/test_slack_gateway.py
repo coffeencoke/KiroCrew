@@ -4173,7 +4173,7 @@ class TestAutoApplyUpdateVenvPath:
                                 with patch("os.execv", side_effect=OSError("test")):
                                     # Resolves: the optional kiro-cli step runs.
                                     with patch(
-                                        "kiro_crew.slack.gateway.resolve_kiro_cli",
+                                        "kiro_crew.kiro_cli.resolve_kiro_cli",
                                         return_value="/usr/bin/kiro-cli",
                                     ):
                                         # The gateway resolves _kill_and_reap
@@ -4236,7 +4236,7 @@ class TestAutoApplyUpdateVenvPath:
                             ):
                                 with patch("os.execv", side_effect=OSError("test")):
                                     with patch(
-                                        "kiro_crew.slack.gateway.resolve_kiro_cli",
+                                        "kiro_crew.kiro_cli.resolve_kiro_cli",
                                         return_value="/opt/pinned/bin/kiro-cli",
                                     ):
                                         await orch._auto_apply_update()
@@ -4284,7 +4284,7 @@ class TestAutoApplyUpdateVenvPath:
                             ):
                                 with patch("os.execv", side_effect=OSError("test")):
                                     with patch(
-                                        "kiro_crew.slack.gateway.resolve_kiro_cli",
+                                        "kiro_crew.kiro_cli.resolve_kiro_cli",
                                         return_value="/opt/pinned/bin/kiro-cli",
                                     ) as mock_resolve:
                                         await orch._auto_apply_update()
@@ -4330,7 +4330,7 @@ class TestAutoApplyUpdateVenvPath:
                             ) as mock_build:
                                 with patch("os.execv", side_effect=OSError("test")):
                                     with patch(
-                                        "kiro_crew.slack.gateway.resolve_kiro_cli",
+                                        "kiro_crew.kiro_cli.resolve_kiro_cli",
                                         return_value=None,
                                     ):
                                         await orch._auto_apply_update()
@@ -6900,9 +6900,7 @@ class TestCheckMissingDepsPip:
         proc.kill = MagicMock()
         proc.communicate = MagicMock(side_effect=_communicate)
         orch = _make_orchestrator()
-        with patch(
-            "kiro_crew.slack.gateway.resolve_kiro_cli", return_value="/opt/pinned/bin/kiro-cli"
-        ):
+        with patch("kiro_crew.kiro_cli.resolve_kiro_cli", return_value="/opt/pinned/bin/kiro-cli"):
             with patch("asyncio.create_subprocess_exec", AsyncMock(return_value=proc)):
                 await orch._warn_if_kiro_cli_outdated()  # must not raise
         proc.kill.assert_called_once()

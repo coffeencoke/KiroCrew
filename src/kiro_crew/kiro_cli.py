@@ -340,7 +340,7 @@ def pin_kiro_cli() -> tuple[str | None, bool]:
     install, since the note already names the fix.
 
     Sync and unbounded: it stats directories under the home directory. The
-    gateway's unattended paths wrap the same probe in a thread with a timeout
+    gateway's unattended paths run this in a thread under a timeout
     (``slack.gateway._pinned_kiro_cli``); a CLI command or a request handler
     already blocking on the spawn itself has nothing to gain from that.
     """
