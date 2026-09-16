@@ -10,7 +10,7 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from collections.abc import AsyncIterator
 from functools import cached_property
-from typing import Literal, Protocol, runtime_checkable
+from typing import TYPE_CHECKING, Literal, Protocol, runtime_checkable
 
 # Event kinds — re-exported from the single source of truth
 from kiro_crew.acp.types import (  # noqa: F401
@@ -31,6 +31,9 @@ from kiro_crew.acp.types import (  # noqa: F401
 from kiro_crew.acp.types import AcpEvent as LLMEvent  # noqa: F401
 from kiro_crew.constants import COMPACT_WAIT_TIMEOUT_SECS
 from kiro_crew.essential_delivery import EssentialDelivery
+
+if TYPE_CHECKING:
+    from kiro_crew.agent_sdk.tool_search import ToolSearchSettings
 
 CancelOutcome = Literal["acked", "timeout", "no_turn", "error"]
 
@@ -409,6 +412,21 @@ class LLMProvider(ABC):
         """True when the provider can host multiplexed sub-agent sessions on one
         process. Default False — session sharing is opt-in, never inherited."""
         return False
+
+    @property
+    def tool_search_settings(self) -> "ToolSearchSettings | None":
+        """The operator's MCP Tool Search choice this provider spawned with, or
+        ``None`` when it carries none.
+
+        Read by whoever builds a runtime on this provider's behalf (a companion
+        runtime for a sub-agent) so that runtime is handed the SAME setting the
+        parent's handshake sent, rather than being left to the host's default.
+        Declared here with a safe default rather than probed off the instance
+        (harness-parity H14): a provider that never threaded the setting answers
+        ``None`` and the runtime it seeds stays exactly as before. The ACP
+        provider answers with its resolved ``ToolSearchSettings``.
+        """
+        return None
 
     @property
     def manual_compact_unsupported_backend(self) -> str | None:
